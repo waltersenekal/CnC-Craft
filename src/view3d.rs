@@ -2,6 +2,7 @@
 //! turn and zoom, the toolpaths at their real depths, and Front/Side cut-through slices.
 
 use crate::app::App;
+use crate::model::{OpKind, ToolKind};
 use egui::{Color32, Pos2, Stroke, Ui, Vec2};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -120,6 +121,24 @@ impl App {
     }
 
     /// Shared panning and zooming for the flat Top / Front / Side views.
+    /// True when every enabled cut is a flat-ended 2.5D cut, so the preview should show
+    /// true vertical walls and flat floors instead of an interpolated surface.
+    fn flat_machining(&self) -> bool {
+        let mut any = false;
+        for (i, tp) in self.doc.toolpaths.iter().enumerate().filter(|(_, t)| t.enabled) {
+            any = true;
+            let flat_op = matches!(tp.op, OpKind::Pocket | OpKind::ProfileOutside | OpKind::ProfileInside | OpKind::ProfileOnLine | OpKind::Drill | OpKind::Bore | OpKind::Surface | OpKind::Dogbone | OpKind::Keyhole);
+            if !flat_op || tp.ramp {
+                return false;
+            }
+            let Some(tool) = self.job.tools.get(i).and_then(|t| t.as_ref()) else { return false };
+            if !matches!(tool.kind, ToolKind::FlatEnd | ToolKind::Drill) {
+                return false;
+            }
+        }
+        any
+    }
+
     pub(crate) fn preview_pan_zoom(&mut self, ui: &Ui, resp: &egui::Response) {
         let cam = &mut self.design.cam;
         if resp.dragged_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
@@ -225,10 +244,10 @@ impl App {
             let b = sim.heights[j1 * w + i0] * (1.0 - tx) + sim.heights[j1 * w + i1] * tx;
             a * (1.0 - ty) + b * ty
         };
-        // A very small blur turns the raster wall stair-steps into a soft machined
-        // edge; it is only used for this 3D view, so the top view stays exact.
-        let height_at = |x: f32, y: f32| -> f32 {
-            let e = (cell * 3.0).max(0.2);
+        // Curved and V-shaped cuts keep a small machined-edge blur; flat-ended cuts
+        // below use the raw heights so their walls stay vertical.
+        let smooth_height = |x: f32, y: f32| -> f32 {
+            let e = (cell * 2.0).max(0.2);
             let (c, a, d) = (raw_height(x, y), raw_height(x - e, y) + raw_height(x + e, y) + raw_height(x, y - e) + raw_height(x, y + e), raw_height(x - e, y - e) + raw_height(x + e, y - e) + raw_height(x - e, y + e) + raw_height(x + e, y + e));
             (c * 4.0 + a * 2.0 + d) / 16.0
         };
@@ -238,8 +257,8 @@ impl App {
             let x1 = (x + e).min(sw);
             let y0 = (y - e).max(0.0);
             let y1 = (y + e).min(sh);
-            let dx = (height_at(x1, y) - height_at(x0, y)) / (x1 - x0).max(1e-6) * exag;
-            let dy = (height_at(x, y1) - height_at(x, y0)) / (y1 - y0).max(1e-6) * exag;
+            let dx = (smooth_height(x1, y) - smooth_height(x0, y)) / (x1 - x0).max(1e-6) * exag;
+            let dy = (smooth_height(x, y1) - smooth_height(x, y0)) / (y1 - y0).max(1e-6) * exag;
             normalize3([-dx, -dy, 1.0])
         };
 
@@ -255,72 +274,261 @@ impl App {
             Color32::from_rgb((base[0] * k).clamp(0.0, 255.0) as u8, (base[1] * k).clamp(0.0, 255.0) as u8, (base[2] * k).clamp(0.0, 255.0) as u8)
         };
 
-        // Build a shared-vertex grid so Gouraud shading is continuous across the surface.
-        let target_quads = 110_000.0f32;
+        // Flat-ended 2.5D cuts get a block surface with true vertical walls. Curved,
+        // V-shaped and ball-nose cuts keep the smooth shared-vertex surface.
+        let flat = self.flat_machining();
+        let target_quads = if flat { 300_000.0 } else { 160_000.0 };
         let step = (((w * h) as f32 / target_quads).sqrt().ceil() as usize).max(1);
         let gw = w.div_ceil(step);
         let gh = h.div_ceil(step);
-        let mut verts: Vec<egui::epaint::Vertex> = Vec::with_capacity((gw + 1) * (gh + 1) + 4 * (gw + gh));
+        let mut verts: Vec<egui::epaint::Vertex> = Vec::with_capacity(gw * gh * 4 + 4 * (gw + gh));
         let mut vdepth: Vec<f32> = Vec::with_capacity(verts.capacity());
-        let mut tris: Vec<(f32, [u32; 3])> = Vec::with_capacity(gw * gh * 2 + 4 * (gw + gh) * 2);
-        let mut grid_idx: Vec<u32> = Vec::with_capacity((gw + 1) * (gh + 1));
-        for gj in 0..=gh {
-            let y = (gj * step).min(h) as f32 * cell;
-            for gi in 0..=gw {
-                let x = (gi * step).min(w) as f32 * cell;
-                let z = height_at(x, y);
-                let n = normal_at(x, y);
-                let col = lit(n, wood_rgb(x, y, z, thick));
-                let (pos, d) = project(x, y, z);
-                grid_idx.push(verts.len() as u32);
-                verts.push(egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color: col });
-                vdepth.push(d);
-            }
-        }
-        for gj in 0..gh {
-            for gi in 0..gw {
-                let i00 = grid_idx[gj * (gw + 1) + gi];
-                let i10 = i00 + 1;
-                let i01 = grid_idx[(gj + 1) * (gw + 1) + gi];
-                let i11 = i01 + 1;
-                let d = (vdepth[i00 as usize] + vdepth[i10 as usize] + vdepth[i01 as usize] + vdepth[i11 as usize]) / 4.0;
-                tris.push((d, [i00, i10, i11]));
-                tris.push((d, [i00, i11, i01]));
-            }
-        }
+        let mut tris: Vec<(f32, [u32; 3])> = Vec::with_capacity(gw * gh * 2 + 8 * (gw + gh) * 2);
 
-        // The four cut faces, shaded with their own outward normals and a vertical grain.
-        let mut add_wall = |x0: f32, y0: f32, x1: f32, y1: f32, n: [f32; 3]| {
-            let z0 = height_at(x0, y0);
-            let z1 = height_at(x1, y1);
-            if z0 <= bottom + 1e-3 && z1 <= bottom + 1e-3 {
-                return;
+        if flat {
+            // Only mesh the part of the stock that can be on screen, and make the
+            // cells finer as the view zooms in. This keeps radii smooth without
+            // turning the whole stock into millions of triangles.
+            let inv = |p: Pos2, z: f32| -> [f32; 2] {
+                let xr = (p.x - center.x) / scale;
+                let up = -(p.y - center.y) / scale;
+                let dz = z * exag - cz;
+                let yr = (up - dz * cp) / sp.max(1e-4);
+                let dx = xr * cy_ + yr * sy_;
+                let dy = -xr * sy_ + yr * cy_;
+                [cx + dx, cy + dy]
+            };
+            let (mut mn, mut mx) = ([f32::MAX; 2], [f32::MIN; 2]);
+            for p in [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()] {
+                for z in [0.0, bottom] {
+                    let q = inv(p, z);
+                    mn = [mn[0].min(q[0]), mn[1].min(q[1])];
+                    mx = [mx[0].max(q[0]), mx[1].max(q[1])];
+                }
             }
-            let base = verts.len() as u32;
-            for (x, y, z) in [(x0, y0, z0), (x1, y1, z1), (x1, y1, bottom), (x0, y0, bottom)] {
+            let margin = (sw + sh) * 0.02 + cell * 2.0;
+            let (minx, maxx) = ((mn[0] - margin).clamp(0.0, sw), (mx[0] + margin).clamp(0.0, sw));
+            let (miny, maxy) = ((mn[1] - margin).clamp(0.0, sh), (mx[1] + margin).clamp(0.0, sh));
+            let vis_cells = (((maxx - minx).max(cell) / cell) * ((maxy - miny).max(cell) / cell)).max(1.0);
+            let fstep = (vis_cells / 450_000.0).sqrt().ceil().max(1.0).min(8.0) as usize;
+            let gi0 = ((minx / cell) as usize) / fstep;
+            let gi1 = (((maxx / cell).ceil() as usize).min(w)).div_ceil(fstep);
+            let gj0 = ((miny / cell) as usize) / fstep;
+            let gj1 = (((maxy / cell).ceil() as usize).min(h)).div_ceil(fstep);
+            let last_gi = w.div_ceil(fstep).saturating_sub(1);
+            let last_gj = h.div_ceil(fstep).saturating_sub(1);
+            let x_at = |gi: usize| (gi * fstep).min(w) as f32 * cell;
+            let y_at = |gj: usize| (gj * fstep).min(h) as f32 * cell;
+            let z_at = |gi: usize, gj: usize| -> f32 {
+                let i = (gi * fstep + fstep / 2).min(w - 1);
+                let j = (gj * fstep + fstep / 2).min(h - 1);
+                sim.heights[j * w + i]
+            };
+            let draw_z = |z: f32| if z <= bottom + 0.05 { bottom - 0.2 } else { z };
+            let mut add_quad = |p: [(Pos2, f32); 4], c: [Color32; 4]| {
+                let base = verts.len() as u32;
+                for k in 0..4 {
+                    verts.push(egui::epaint::Vertex { pos: p[k].0, uv: egui::epaint::WHITE_UV, color: c[k] });
+                    vdepth.push(p[k].1);
+                }
+                let d = (p[0].1 + p[1].1 + p[2].1 + p[3].1) / 4.0;
+                tris.push((d, [base, base + 1, base + 2]));
+                tris.push((d, [base, base + 2, base + 3]));
+            };
+            let top_col = |x: f32, y: f32, z: f32| -> Color32 {
+                if z <= bottom + 0.05 {
+                    Color32::from_rgb(36, 40, 48)
+                } else {
+                    lit([0.0, 0.0, 1.0], wood_rgb(x, y, z, thick))
+                }
+            };
+            let wall_col = |x: f32, y: f32, z: f32, n: [f32; 3]| -> Color32 {
+                if z <= bottom + 0.05 {
+                    return Color32::from_rgb(34, 37, 43);
+                }
+                let n = if dot3(n, view) < 0.0 { [-n[0], -n[1], -n[2]] } else { n };
                 let depth = ((-z) / thick.max(0.1)).clamp(0.0, 1.0);
                 let grain = (((x * 0.33 + (y * 2.1).sin() * 1.2).sin()) * 0.5 + 0.5) * 8.0;
-                let basecol = [152.0 - depth * 26.0 - grain, 114.0 - depth * 22.0 - grain * 0.8, 72.0 - depth * 16.0 - grain * 0.5];
-                let col = if z <= bottom + 0.05 { Color32::from_rgb(34, 37, 43) } else { lit(n, basecol) };
-                let (pos, d) = project(x, y, z);
-                verts.push(egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color: col });
-                vdepth.push(d);
+                lit(n, [152.0 - depth * 26.0 - grain, 114.0 - depth * 22.0 - grain * 0.8, 72.0 - depth * 16.0 - grain * 0.5])
+            };
+
+            // Flat tops: each cell stays at its own height, so the surface is not
+            // interpolated across the cell and the wall below is truly vertical.
+            for gj in gj0..gj1 {
+                let y0 = y_at(gj);
+                let y1 = y_at(gj + 1);
+                for gi in gi0..gi1 {
+                    let x0 = x_at(gi);
+                    let x1 = x_at(gi + 1);
+                    let z = draw_z(z_at(gi, gj));
+                    add_quad(
+                        [project(x0, y0, z), project(x1, y0, z), project(x1, y1, z), project(x0, y1, z)],
+                        [top_col(x0, y0, z), top_col(x1, y0, z), top_col(x1, y1, z), top_col(x0, y1, z)],
+                    );
+                }
             }
-            let d = (vdepth[base as usize] + vdepth[base as usize + 1] + vdepth[base as usize + 2] + vdepth[base as usize + 3]) / 4.0;
-            tris.push((d, [base, base + 1, base + 2]));
-            tris.push((d, [base, base + 2, base + 3]));
-        };
-        for gi in 0..gw {
-            let x0 = (gi * step).min(w) as f32 * cell;
-            let x1 = ((gi + 1) * step).min(w) as f32 * cell;
-            add_wall(x0, 0.0, x1, 0.0, [0.0, -1.0, 0.0]);
-            add_wall(x0, sh, x1, sh, [0.0, 1.0, 0.0]);
-        }
-        for gj in 0..gh {
-            let y0 = (gj * step).min(h) as f32 * cell;
-            let y1 = ((gj + 1) * step).min(h) as f32 * cell;
-            add_wall(0.0, y0, 0.0, y1, [-1.0, 0.0, 0.0]);
-            add_wall(sw, y0, sw, y1, [1.0, 0.0, 0.0]);
+            // Vertical walls between neighbouring cells of different heights.
+            for gj in gj0..gj1 {
+                let y0 = y_at(gj);
+                let y1 = y_at(gj + 1);
+                for gi in gi0..gi1.saturating_sub(1) {
+                    let a = z_at(gi, gj);
+                    let b = z_at(gi + 1, gj);
+                    if (a - b).abs() <= 0.01 {
+                        continue;
+                    }
+                    let hi = draw_z(a.max(b));
+                    let lo = draw_z(a.min(b));
+                    if hi - lo <= 0.005 {
+                        continue;
+                    }
+                    let x = x_at(gi + 1);
+                    let n = if a > b { [1.0, 0.0, 0.0] } else { [-1.0, 0.0, 0.0] };
+                    add_quad(
+                        [project(x, y0, hi), project(x, y1, hi), project(x, y1, lo), project(x, y0, lo)],
+                        [wall_col(x, y0, hi, n), wall_col(x, y1, hi, n), wall_col(x, y1, lo, n), wall_col(x, y0, lo, n)],
+                    );
+                }
+            }
+            for gj in gj0..gj1.saturating_sub(1) {
+                let y = y_at(gj + 1);
+                for gi in gi0..gi1 {
+                    let a = z_at(gi, gj);
+                    let b = z_at(gi, gj + 1);
+                    if (a - b).abs() <= 0.01 {
+                        continue;
+                    }
+                    let hi = draw_z(a.max(b));
+                    let lo = draw_z(a.min(b));
+                    if hi - lo <= 0.005 {
+                        continue;
+                    }
+                    let x0 = x_at(gi);
+                    let x1 = x_at(gi + 1);
+                    let n = if a > b { [0.0, 1.0, 0.0] } else { [0.0, -1.0, 0.0] };
+                    add_quad(
+                        [project(x0, y, hi), project(x1, y, hi), project(x1, y, lo), project(x0, y, lo)],
+                        [wall_col(x0, y, hi, n), wall_col(x1, y, hi, n), wall_col(x1, y, lo, n), wall_col(x0, y, lo, n)],
+                    );
+                }
+            }
+            // The outside of the stock, when that side is on screen.
+            if gi0 == 0 {
+                for gj in gj0..gj1 {
+                    let y0 = y_at(gj);
+                    let y1 = y_at(gj + 1);
+                    let z = draw_z(z_at(0, gj));
+                    if z <= bottom + 0.01 {
+                        continue;
+                    }
+                    add_quad(
+                        [project(0.0, y0, z), project(0.0, y1, z), project(0.0, y1, bottom), project(0.0, y0, bottom)],
+                        [wall_col(0.0, y0, z, [-1.0, 0.0, 0.0]), wall_col(0.0, y1, z, [-1.0, 0.0, 0.0]), wall_col(0.0, y1, bottom, [-1.0, 0.0, 0.0]), wall_col(0.0, y0, bottom, [-1.0, 0.0, 0.0])],
+                    );
+                }
+            }
+            if gi1 == last_gi + 1 {
+                for gj in gj0..gj1 {
+                    let y0 = y_at(gj);
+                    let y1 = y_at(gj + 1);
+                    let z = draw_z(z_at(last_gi, gj));
+                    if z <= bottom + 0.01 {
+                        continue;
+                    }
+                    add_quad(
+                        [project(sw, y0, z), project(sw, y1, z), project(sw, y1, bottom), project(sw, y0, bottom)],
+                        [wall_col(sw, y0, z, [1.0, 0.0, 0.0]), wall_col(sw, y1, z, [1.0, 0.0, 0.0]), wall_col(sw, y1, bottom, [1.0, 0.0, 0.0]), wall_col(sw, y0, bottom, [1.0, 0.0, 0.0])],
+                    );
+                }
+            }
+            if gj0 == 0 {
+                for gi in gi0..gi1 {
+                    let x0 = x_at(gi);
+                    let x1 = x_at(gi + 1);
+                    let z = draw_z(z_at(gi, 0));
+                    if z <= bottom + 0.01 {
+                        continue;
+                    }
+                    add_quad(
+                        [project(x0, 0.0, z), project(x1, 0.0, z), project(x1, 0.0, bottom), project(x0, 0.0, bottom)],
+                        [wall_col(x0, 0.0, z, [0.0, -1.0, 0.0]), wall_col(x1, 0.0, z, [0.0, -1.0, 0.0]), wall_col(x1, 0.0, bottom, [0.0, -1.0, 0.0]), wall_col(x0, 0.0, bottom, [0.0, -1.0, 0.0])],
+                    );
+                }
+            }
+            if gj1 == last_gj + 1 {
+                for gi in gi0..gi1 {
+                    let x0 = x_at(gi);
+                    let x1 = x_at(gi + 1);
+                    let z = draw_z(z_at(gi, last_gj));
+                    if z <= bottom + 0.01 {
+                        continue;
+                    }
+                    add_quad(
+                        [project(x0, sh, z), project(x1, sh, z), project(x1, sh, bottom), project(x0, sh, bottom)],
+                        [wall_col(x0, sh, z, [0.0, 1.0, 0.0]), wall_col(x1, sh, z, [0.0, 1.0, 0.0]), wall_col(x1, sh, bottom, [0.0, 1.0, 0.0]), wall_col(x0, sh, bottom, [0.0, 1.0, 0.0])],
+                    );
+                }
+            }
+        } else {
+            let mut grid_idx: Vec<u32> = Vec::with_capacity((gw + 1) * (gh + 1));
+            for gj in 0..=gh {
+                let y = (gj * step).min(h) as f32 * cell;
+                for gi in 0..=gw {
+                    let x = (gi * step).min(w) as f32 * cell;
+                    let z = smooth_height(x, y);
+                    let n = normal_at(x, y);
+                    let col = lit(n, wood_rgb(x, y, z, thick));
+                    let (pos, d) = project(x, y, z);
+                    grid_idx.push(verts.len() as u32);
+                    verts.push(egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color: col });
+                    vdepth.push(d);
+                }
+            }
+            for gj in 0..gh {
+                for gi in 0..gw {
+                    let i00 = grid_idx[gj * (gw + 1) + gi];
+                    let i10 = i00 + 1;
+                    let i01 = grid_idx[(gj + 1) * (gw + 1) + gi];
+                    let i11 = i01 + 1;
+                    let d = (vdepth[i00 as usize] + vdepth[i10 as usize] + vdepth[i01 as usize] + vdepth[i11 as usize]) / 4.0;
+                    tris.push((d, [i00, i10, i11]));
+                    tris.push((d, [i00, i11, i01]));
+                }
+            }
+
+            // The four cut faces, shaded with their own outward normals and a vertical grain.
+            let mut add_wall = |x0: f32, y0: f32, x1: f32, y1: f32, n: [f32; 3]| {
+                let z0 = smooth_height(x0, y0);
+                let z1 = smooth_height(x1, y1);
+                if z0 <= bottom + 1e-3 && z1 <= bottom + 1e-3 {
+                    return;
+                }
+                let base = verts.len() as u32;
+                for (x, y, z) in [(x0, y0, z0), (x1, y1, z1), (x1, y1, bottom), (x0, y0, bottom)] {
+                    let depth = ((-z) / thick.max(0.1)).clamp(0.0, 1.0);
+                    let grain = (((x * 0.33 + (y * 2.1).sin() * 1.2).sin()) * 0.5 + 0.5) * 8.0;
+                    let basecol = [152.0 - depth * 26.0 - grain, 114.0 - depth * 22.0 - grain * 0.8, 72.0 - depth * 16.0 - grain * 0.5];
+                    let col = if z <= bottom + 0.05 { Color32::from_rgb(34, 37, 43) } else { lit(n, basecol) };
+                    let (pos, d) = project(x, y, z);
+                    verts.push(egui::epaint::Vertex { pos, uv: egui::epaint::WHITE_UV, color: col });
+                    vdepth.push(d);
+                }
+                let d = (vdepth[base as usize] + vdepth[base as usize + 1] + vdepth[base as usize + 2] + vdepth[base as usize + 3]) / 4.0;
+                tris.push((d, [base, base + 1, base + 2]));
+                tris.push((d, [base, base + 2, base + 3]));
+            };
+            for gi in 0..gw {
+                let x0 = (gi * step).min(w) as f32 * cell;
+                let x1 = ((gi + 1) * step).min(w) as f32 * cell;
+                add_wall(x0, 0.0, x1, 0.0, [0.0, -1.0, 0.0]);
+                add_wall(x0, sh, x1, sh, [0.0, 1.0, 0.0]);
+            }
+            for gj in 0..gh {
+                let y0 = (gj * step).min(h) as f32 * cell;
+                let y1 = ((gj + 1) * step).min(h) as f32 * cell;
+                add_wall(0.0, y0, 0.0, y1, [-1.0, 0.0, 0.0]);
+                add_wall(sw, y0, sw, y1, [1.0, 0.0, 0.0]);
+            }
         }
 
         tris.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -335,19 +543,19 @@ impl App {
         let mut rim: Vec<Pos2> = vec![];
         for gi in 0..=gw {
             let x = (gi * step).min(w) as f32 * cell;
-            rim.push(project(x, 0.0, height_at(x, 0.0)).0);
+            rim.push(project(x, 0.0, if flat { raw_height(x, 0.0) } else { smooth_height(x, 0.0) }).0);
         }
         for gj in 1..=gh {
             let y = (gj * step).min(h) as f32 * cell;
-            rim.push(project(sw, y, height_at(sw, y)).0);
+            rim.push(project(sw, y, if flat { raw_height(sw, y) } else { smooth_height(sw, y) }).0);
         }
         for gi in (0..gw).rev() {
             let x = (gi * step).min(w) as f32 * cell;
-            rim.push(project(x, sh, height_at(x, sh)).0);
+            rim.push(project(x, sh, if flat { raw_height(x, sh) } else { smooth_height(x, sh) }).0);
         }
         for gj in (1..gh).rev() {
             let y = (gj * step).min(h) as f32 * cell;
-            rim.push(project(0.0, y, height_at(0.0, y)).0);
+            rim.push(project(0.0, y, if flat { raw_height(0.0, y) } else { smooth_height(0.0, y) }).0);
         }
         if rim.len() > 1 {
             rim.push(rim[0]);

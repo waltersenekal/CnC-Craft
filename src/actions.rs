@@ -265,7 +265,7 @@ impl App {
     }
 
     pub fn reset_sim(&mut self) {
-        let mut s = Sim::new(&self.doc.stock, 400_000);
+        let mut s = Sim::new(&self.doc.stock, 800_000);
         s.dirty = true;
         self.sim = Some(s);
     }
