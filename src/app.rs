@@ -528,6 +528,10 @@ impl App {
             app.preview_open = true;
             app.design.preview_max = true;
         }
+        if std::env::var("CNCCRAFT_COMPARE").is_ok() {
+            app.preview_open = true;
+            app.design.cam.show_compare = true;
+        }
         if let Ok(z) = std::env::var("CNCCRAFT_PREVIEW_ZOOM") {
             if let Ok(z) = z.parse::<f32>() {
                 app.design.cam.zoom = z.clamp(0.2, 20.0);

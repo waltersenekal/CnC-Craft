@@ -24,11 +24,13 @@ pub struct Cam {
     /// where the Front (Y) and Side (X) slices cut through, as a fraction of the stock
     pub section: f32,
     pub img: Option<egui::ColorImage>,
+    /// Overlay the drawing outline and the edge the bit actually leaves.
+    pub show_compare: bool,
 }
 
 impl Default for Cam {
     fn default() -> Self {
-        Cam { view: PreviewView::Top, yaw: -0.6, pitch: 0.75, zoom: 1.0, pan: Vec2::ZERO, exag: 1.0, section: 0.5, img: None }
+        Cam { view: PreviewView::Top, yaw: -0.6, pitch: 0.75, zoom: 1.0, pan: Vec2::ZERO, exag: 1.0, section: 0.5, img: None, show_compare: false }
     }
 }
 
@@ -92,6 +94,20 @@ fn mp_bbox(mp: &MultiPolygon<f64>) -> Option<([f32; 2], [f32; 2])> {
     any.then_some((mn, mx))
 }
 
+/// Every ring of a region as plain world points for overlay lines.
+fn mp_rings(mp: &MultiPolygon<f64>) -> Vec<Vec<[f64; 2]>> {
+    let mut out = vec![];
+    for poly in &mp.0 {
+        for ring in std::iter::once(poly.exterior()).chain(poly.interiors()) {
+            let pts: Vec<[f64; 2]> = ring.0.iter().map(|c| [c.x, c.y]).collect();
+            if pts.len() >= 2 {
+                out.push(pts);
+            }
+        }
+    }
+    out
+}
+
 fn push_quad(verts: &mut Vec<egui::epaint::Vertex>, vdepth: &mut Vec<f32>, tris: &mut Vec<(f32, [u32; 3])>, p: [(Pos2, f32); 4], c: [Color32; 4]) {
     let base = verts.len() as u32;
     for k in 0..4 {
@@ -137,6 +153,7 @@ impl App {
             if ui.add(egui::Button::new(max_label).small()).on_hover_text(if self.design.preview_max { "Return to a floating window" } else { "Fill the window with the preview" }).clicked() {
                 toggle_max = true;
             }
+            if cam.view == PreviewView::Iso && ui.checkbox(&mut cam.show_compare, "Compare").on_hover_text("Show the drawing outline, the edge the bit actually leaves, and material left at the corners").changed() {}
             ui.separator();
             ui.label("Depth ×");
             ui.add(egui::Slider::new(&mut cam.exag, 1.0..=6.0).max_decimals(1)).on_hover_text("Exaggerate depths so shallow cuts are easier to see");
@@ -243,6 +260,43 @@ impl App {
         Some(VectorModel { top, floors, pocket_walls, outer: if has_profile { part } else { stock } })
     }
 
+    /// Drawing outlines, the boundaries the bit leaves, and material left at pocket corners.
+    fn compare_rings(&self, model: Option<&VectorModel>) -> (Vec<Vec<[f64; 2]>>, Vec<Vec<[f64; 2]>>, Vec<MultiPolygon<f64>>) {
+        let mut ideal = vec![];
+        let mut deviations = vec![];
+        let mut has_profile = false;
+        for (i, tp) in self.doc.toolpaths.iter().enumerate().filter(|(_, t)| t.enabled && matches!(t.op, OpKind::Pocket | OpKind::ProfileOutside)) {
+            let shapes: Vec<&crate::model::Shape> = tp.shape_ids.iter().filter(|id| !self.doc.keepout.contains(id)).filter_map(|id| self.doc.shape(*id)).collect();
+            let mp = crate::geom::region_of(shapes.into_iter());
+            if mp.0.is_empty() {
+                continue;
+            }
+            ideal.extend(mp_rings(&mp));
+            if tp.op == OpKind::ProfileOutside {
+                has_profile = true;
+            } else if let Some(tool) = self.job.tools.get(i).and_then(|t| t.as_ref()) {
+                let r = tool.radius();
+                if r > 1e-6 {
+                    let floor = crate::geom::offset_region(&crate::geom::offset_region(&mp, -r), r);
+                    let left = mp.difference(&floor);
+                    if !left.0.is_empty() {
+                        deviations.push(left);
+                    }
+                }
+            }
+        }
+        let mut actual = vec![];
+        if let Some(m) = model {
+            for (mp, _) in &m.floors {
+                actual.extend(mp_rings(mp));
+            }
+            if has_profile {
+                actual.extend(mp_rings(&m.outer));
+            }
+        }
+        (ideal, actual, deviations)
+    }
+
     pub(crate) fn preview_pan_zoom(&mut self, ui: &Ui, resp: &egui::Response) {
         let cam = &mut self.design.cam;
         if resp.dragged_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
@@ -328,6 +382,7 @@ impl App {
         let flat = self.flat_machining();
         let vector = self.flat_vector_model();
         let has_vector = vector.is_some();
+        let compare = if cam.show_compare { Some(self.compare_rings(vector.as_ref())) } else { None };
         let (smn, smx) = vector.as_ref().and_then(|m| mp_bbox(&m.outer)).unwrap_or(([0.0, 0.0], [sw, sh]));
 
         // A soft contact shadow makes the block sit on a surface rather than float.
@@ -709,6 +764,57 @@ impl App {
         }
         painter.add(egui::Shape::mesh(mesh));
 
+        if let Some((ideal, actual, deviations)) = &compare {
+            let mut fill = egui::epaint::Mesh::default();
+            for mp in deviations {
+                for poly in &mp.0 {
+                    for tri in poly.earcut_triangles() {
+                        let mut p = [(Pos2::ZERO, 0.0f32); 3];
+                        for (k, q) in [tri.v1(), tri.v2(), tri.v3()].into_iter().enumerate() {
+                            p[k] = project(q.x as f32, q.y as f32, 0.0);
+                        }
+                        let base = fill.vertices.len() as u32;
+                        for q in p {
+                            fill.colored_vertex(q.0, Color32::from_rgba_unmultiplied(255, 120, 45, 80));
+                        }
+                        fill.add_triangle(base, base + 1, base + 2);
+                    }
+                }
+            }
+            painter.add(egui::Shape::mesh(fill));
+            let draw = |ring: &[[f64; 2]], color: Color32, dashed: bool| {
+                let pts: Vec<Pos2> = ring.iter().map(|p| project(p[0] as f32, p[1] as f32, 0.0).0).collect();
+                if pts.len() < 2 {
+                    return;
+                }
+                let stroke = Stroke::new(1.35f32, color);
+                if dashed {
+                    painter.extend(egui::Shape::dashed_line(&pts, stroke, 6.0, 4.0));
+                } else {
+                    let mut pts = pts;
+                    pts.push(pts[0]);
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
+            };
+            for ring in actual {
+                draw(ring, Color32::from_rgb(255, 168, 52), false);
+            }
+            for ring in ideal {
+                draw(ring, Color32::from_rgb(80, 190, 255), true);
+            }
+            let legend = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(204.0, 66.0));
+            painter.rect_filled(legend, 3.0, Color32::from_black_alpha(120));
+            let (x, y) = (legend.left() + 8.0, legend.top() + 13.0);
+            painter.extend(egui::Shape::dashed_line(&[Pos2::new(x, y), Pos2::new(x + 22.0, y)], Stroke::new(1.6f32, Color32::from_rgb(80, 190, 255)), 4.0, 3.0));
+            painter.text(Pos2::new(x + 28.0, y), egui::Align2::LEFT_CENTER, "drawing outline", egui::FontId::proportional(11.0), Color32::from_rgb(170, 220, 255));
+            let y2 = y + 17.0;
+            painter.line_segment([Pos2::new(x, y2), Pos2::new(x + 22.0, y2)], Stroke::new(1.3f32, Color32::from_rgb(255, 168, 52)));
+            painter.text(Pos2::new(x + 28.0, y2), egui::Align2::LEFT_CENTER, "actual cut edge", egui::FontId::proportional(11.0), Color32::from_rgb(255, 205, 150));
+            let y3 = y2 + 17.0;
+            painter.rect_filled(egui::Rect::from_min_size(Pos2::new(x, y3 - 3.0), egui::vec2(22.0, 6.0)), 1.0, Color32::from_rgba_unmultiplied(255, 120, 45, 80));
+            painter.text(Pos2::new(x + 28.0, y3), egui::Align2::LEFT_CENTER, "left by the bit", egui::FontId::proportional(11.0), Color32::from_rgb(255, 190, 140));
+        }
+
         // A light rim along the stock's top edge catches the studio light.
         if !has_vector {
         let mut rim: Vec<Pos2> = vec![];
@@ -861,17 +967,21 @@ mod tests {
         let pocket = doc.shape(106).unwrap();
         let part_mp = crate::geom::region_of(std::iter::once(part));
         let pocket_mp = crate::geom::region_of(std::iter::once(pocket));
-        let top = part_mp.difference(&pocket_mp);
-        let mut tri_area = 0.0;
-        let mut count = 0;
-        for poly in &top.0 {
-            for t in poly.earcut_triangles() {
-                let (a, b, c) = (t.v1(), t.v2(), t.v3());
-                tri_area += ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs() / 2.0;
-                count += 1;
+        let r = 3.175;
+        let floor = crate::geom::offset_region(&crate::geom::offset_region(&pocket_mp, -r), r);
+        let top = part_mp.difference(&floor);
+        for (name, mp) in [("floor", &floor), ("top", &top)] {
+            let mut tri_area = 0.0;
+            let mut count = 0;
+            for poly in &mp.0 {
+                for t in poly.earcut_triangles() {
+                    let (a, b, c) = (t.v1(), t.v2(), t.v3());
+                    tri_area += ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs() / 2.0;
+                    count += 1;
+                }
             }
+            assert!(count > 0, "{name} has no triangles");
+            assert!((tri_area - mp.unsigned_area()).abs() < 1e-6, "{name} has holes in its triangles: {tri_area} vs {}", mp.unsigned_area());
         }
-        assert!(count > 0);
-        assert!((tri_area - top.unsigned_area()).abs() < 1e-6, "the top has holes in its triangles: {tri_area} vs {}", top.unsigned_area());
     }
 }
