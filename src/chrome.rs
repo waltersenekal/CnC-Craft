@@ -306,10 +306,38 @@ impl App {
                 ui.separator();
                 ui.label(format!("Job: {} · {} toolpath(s)", cam::format_time(self.job.time_s), self.doc.toolpaths.iter().filter(|t| t.enabled).count()));
                 if !self.job.warnings.is_empty() {
-                    ui.label(RichText::new(format!("⚠ {}", self.job.warnings.len())).color(Color32::from_rgb(250, 200, 70))).on_hover_text(self.job.warnings.join("\n"));
+                    let text = RichText::new(format!("⚠ {}", self.job.warnings.len())).color(Color32::from_rgb(250, 200, 70));
+                    let mut hover = self.job.warnings.join("\n");
+                    if !self.job.issues.is_empty() {
+                        hover.push_str("\n\nDouble-click to zoom in on the first problem; double-click again for the next.");
+                    }
+                    let r = ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(hover);
+                    if r.double_clicked() {
+                        self.focus_next_issue(None);
+                    }
+                }
+                if let Some(issue) = self.design.issue_focus.clone() {
+                    if let Some(label) = issue.fix_label() {
+                        if ui
+                            .add(egui::Button::new(format!("Fix: {label}")).small())
+                            .on_hover_text("Apply this repair to the highlighted shapes, then check again")
+                            .clicked()
+                        {
+                            self.fix_issue(&issue);
+                        }
+                    }
                 }
                 ui.separator();
-                ui.label(RichText::new(&self.status).color(ui.visuals().text_color()));
+                let status = RichText::new(&self.status).color(ui.visuals().text_color());
+                let status = if self.job.issues.is_empty() {
+                    ui.label(status)
+                } else {
+                    ui.add(egui::Label::new(status).sense(egui::Sense::click()))
+                        .on_hover_text("Double-click to zoom in on the first problem; double-click again for the next.")
+                };
+                if status.double_clicked() {
+                    self.focus_next_issue(None);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(format!("Work X{:.2} Y{:.2} Z{:.2}", self.wpos[0] / k, self.wpos[1] / k, self.wpos[2] / k)).monospace().color(Color32::from_gray(170)));
                 });

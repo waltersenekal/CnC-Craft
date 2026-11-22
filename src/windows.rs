@@ -15,10 +15,15 @@ impl App {
         self.resume_window(ctx);
         if self.preview_open {
             let mut open = true;
-            egui::Window::new("Cut preview").open(&mut open).default_size([760.0, 560.0]).resizable(true).show(ctx, |ui| self.preview_ui(ui));
+            let mut window = egui::Window::new("Cut preview").open(&mut open).default_size([760.0, 560.0]).resizable(true);
+            if self.design.preview_max {
+                window = window.fixed_rect(ctx.screen_rect().shrink(6.0)).resizable(false).movable(false);
+            }
+            window.show(ctx, |ui| self.preview_ui(ui));
             self.preview_open = open;
             if !open {
                 self.sim_playing = false;
+                self.design.preview_max = false;
             }
         }
         if self.gcode_open {
@@ -220,17 +225,21 @@ impl App {
             self.paint_preview_3d(ui, rect, &resp);
             return;
         }
+        let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        self.preview_pan_zoom(ui, &resp);
+        let cam = &self.design.cam;
         let (sw, sh) = (self.doc.stock.width, self.doc.stock.height);
-        let scale = ((avail.x as f64 - 16.0) / sw).min((avail.y as f64 - 16.0) / sh).max(0.01);
+        let base_scale = ((avail.x as f64 - 16.0) / sw).min((avail.y as f64 - 16.0) / sh).max(0.01);
+        let scale = base_scale * cam.zoom as f64;
         let size = egui::vec2((sw * scale) as f32, (sh * scale) as f32);
-        let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
-        let img_rect = egui::Rect::from_center_size(rect.center(), size);
+        let img_rect = egui::Rect::from_center_size(rect.center() + cam.pan, size);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, Color32::from_rgb(24, 26, 30));
         painter.rect_filled(img_rect.translate(egui::vec2(6.0, 6.0)), 2.0, Color32::from_black_alpha(120));
         if let Some(t) = &self.sim_tex {
             painter.image(t.id(), img_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         }
+        painter.rect_stroke(img_rect, 2.0, egui::Stroke::new(1.0f32, Color32::from_rgb(70, 76, 86)), egui::StrokeKind::Inside);
         let to = |x: f64, y: f64| egui::pos2(img_rect.left() + (x * scale) as f32, img_rect.bottom() - (y * scale) as f32);
         if self.sim_show_paths {
             let mut last = [0.0, 0.0];
@@ -250,6 +259,7 @@ impl App {
                 painter.circle(c, ((r * scale) as f32).max(3.0), Color32::from_rgba_unmultiplied(200, 220, 255, 90), egui::Stroke::new(1.5f32, Color32::WHITE));
             }
         }
+        crate::view3d::paint_preview_hint(&painter, rect, "Drag to pan · scroll to zoom · double-click to fit");
     }
 
     pub fn machine_settings_ui(&mut self, ui: &mut egui::Ui) {

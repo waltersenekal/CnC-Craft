@@ -143,6 +143,10 @@ pub struct App {
     pub show_rapids: bool,
     pub job: Job,
     pub job_dirty: bool,
+    /// bumps whenever the job is regenerated, to invalidate cached preview textures
+    pub job_epoch: u64,
+    /// cached 3D texture for the exact-outline vector renderer
+    pub flat_tex: Option<(u64, egui::TextureHandle)>,
     pub preview_open: bool,
     pub sim: Option<Sim>,
     pub sim_tex: Option<egui::TextureHandle>,
@@ -277,6 +281,8 @@ impl App {
             show_rapids: true,
             job: Job::default(),
             job_dirty: true,
+            job_epoch: 0,
+            flat_tex: None,
             preview_open: false,
             sim: None,
             sim_tex: None,
@@ -322,11 +328,12 @@ impl App {
             title: String::new(),
             design: Default::default(),
         };
-        // start with an empty stock; `--sample` (or the File menu) loads the sample job
+        // start with an empty stock; `--sample` (or the File menu) loads the sample job.
+        // A real file argument always wins over the preview/click test hooks.
+        let from_file = open.as_ref().filter(|p| p.to_string_lossy() != "--sample").is_some();
         let want_sample = open.as_ref().map(|p| p.to_string_lossy() == "--sample").unwrap_or(false)
-            || std::env::var("CNCCRAFT_MAKER").is_ok()
-            || std::env::var("CNCCRAFT_CLICK").is_ok()
-            || std::env::var("CNCCRAFT_PREVIEW").is_ok();
+            || (!from_file
+                && (std::env::var("CNCCRAFT_MAKER").is_ok() || std::env::var("CNCCRAFT_CLICK").is_ok() || std::env::var("CNCCRAFT_PREVIEW").is_ok()));
         if let Some(p) = open.filter(|p| p.to_string_lossy() != "--sample") {
             app.open_path(&p);
         }
@@ -523,6 +530,29 @@ impl App {
         if std::env::var("CNCCRAFT_PREVIEW").is_ok() {
             app.preview_open = true;
         }
+        if std::env::var("CNCCRAFT_PREVIEW_MAX").is_ok() {
+            app.preview_open = true;
+            app.design.preview_max = true;
+        }
+        if std::env::var("CNCCRAFT_COMPARE").is_ok() {
+            app.preview_open = true;
+            app.design.cam.show_compare = true;
+        }
+        if let Ok(v) = std::env::var("CNCCRAFT_CAM") {
+            let n: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            if n.len() >= 2 {
+                app.design.cam.yaw = n[0];
+                app.design.cam.pitch = n[1].clamp(0.05, std::f32::consts::FRAC_PI_2);
+            }
+            if n.len() >= 3 {
+                app.design.cam.zoom = n[2].clamp(0.2, 20.0);
+            }
+        }
+        if let Ok(z) = std::env::var("CNCCRAFT_PREVIEW_ZOOM") {
+            if let Ok(z) = z.parse::<f32>() {
+                app.design.cam.zoom = z.clamp(0.2, 20.0);
+            }
+        }
         if let Ok(v) = std::env::var("CNCCRAFT_TP") {
             // test hook: show the settings of the n-th toolpath (1 = first)
             let n = v.parse::<usize>().unwrap_or(1).max(1) - 1;
@@ -541,6 +571,19 @@ impl App {
         }
         if std::env::var("CNCCRAFT_SIM").is_ok() {
             app.machine.send(crate::machine::Cmd::Connect(machine::SIMULATOR.into(), 115200));
+        }
+        if let Ok(which) = std::env::var("CNCCRAFT_ISSUE") {
+            // test hook: two broken outlines and a pocket, framed on the first problem
+            // ("2" frames the second; "fix" repairs the first; "fix2" repairs both)
+            app.broken_outline_design();
+            if which == "2" || which == "fix2" {
+                app.focus_next_issue(None);
+            }
+            if which == "fix" || which == "fix2" {
+                if let Some(issue) = app.design.issue_focus.clone() {
+                    app.fix_issue(&issue);
+                }
+            }
         }
         app
     }
@@ -595,6 +638,44 @@ impl App {
         self.job_dirty = true;
         self.needs_fit = true;
         self.project_path = None;
+    }
+
+    /// Test hook: a pocket over an unjoined DXF-like rectangle and an outline with a
+    /// 2 mm gap, framed on the first problem.
+    pub fn broken_outline_design(&mut self) {
+        let mut d = Document::default();
+        d.stock = Stock { width: 300.0, height: 200.0, ..Stock::default() };
+        let mut ids = vec![];
+        let lines = |a: P, b: P, d: &mut Document, ids: &mut Vec<u64>| {
+            let id = d.new_id();
+            d.shapes.push(Shape { id, kind: ShapeKind::Path, paths: vec![Path { pts: vec![a, b], closed: false }], group: None, text: None, fx: None });
+            ids.push(id);
+        };
+        for (a, b) in [([20.0, 20.0], [120.0, 20.0]), ([120.0, 20.0], [120.0, 100.0]), ([120.0, 100.0], [20.0, 100.0]), ([20.0, 100.0], [20.0, 20.0])] {
+            lines(a, b, &mut d, &mut ids);
+        }
+        let id = d.new_id();
+        d.shapes.push(Shape {
+            id,
+            kind: ShapeKind::Path,
+            paths: vec![Path { pts: vec![[160.0, 20.0], [280.0, 20.0], [280.0, 100.0], [160.0, 100.0], [160.0, 22.0]], closed: false }],
+            group: None,
+            text: None,
+            fx: None,
+        });
+        ids.push(id);
+        let tool = self.settings.tools.iter().find(|t| t.kind == ToolKind::FlatEnd).cloned().unwrap_or_else(|| self.settings.tools[0].clone());
+        let tp_id = d.new_id();
+        let mut tp = Toolpath::new(tp_id, OpKind::Pocket, &tool, ids, 0);
+        tp.name = "Pocket 1".into();
+        d.toolpaths.push(tp);
+        self.selected_tp = Some(tp_id);
+        self.right_tab = RightTab::Toolpaths;
+        self.doc = d;
+        self.job_dirty = true;
+        self.regenerate();
+        self.design.canvas_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 760.0)));
+        self.focus_next_issue(None);
     }
 
     // ---------- undo ----------

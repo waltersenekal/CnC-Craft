@@ -21,9 +21,66 @@ pub struct Job {
     pub gcode: Vec<String>,
     pub time_s: f64,
     pub warnings: Vec<String>,
+    /// Places on the drawing that explain a warning, in toolpath order.
+    pub issues: Vec<crate::diagnostics::Issue>,
     /// Tool used for each toolpath index (diameter, kind, angle).
     pub tools: Vec<Option<Tool>>,
     pub cut_len: f64,
+}
+
+/// A profile outside that includes a nested shape also cuts around that shape at full
+/// depth. When the nested shape is meant to be an enclosed pocket, that silently cuts
+/// its wall away. Warn instead of changing the toolpath behind the user's back.
+fn nested_profile_warnings(doc: &Document, job: &mut Job) {
+    let shallow = |op: OpKind| matches!(op, OpKind::Pocket | OpKind::VCarve | OpKind::Prism | OpKind::Dogbone | OpKind::Bore);
+    for tp in doc.toolpaths.iter().filter(|t| t.enabled && t.op == OpKind::ProfileOutside) {
+        let shapes: Vec<&Shape> = tp.shape_ids.iter().filter_map(|id| doc.shape(*id)).collect();
+        for inner in &shapes {
+            for outer in &shapes {
+                if inner.id == outer.id || !fully_inside(inner, outer) {
+                    continue;
+                }
+                if let Some(other) = doc.toolpaths.iter().find(|t| t.enabled && shallow(t.op) && t.shape_ids.contains(&inner.id)) {
+                    let msg = format!(
+                        "{}: it also cuts around {} at full depth. If that shape should stay an enclosed {}, remove it from this profile or use Profile inside.",
+                        tp.name,
+                        other.name,
+                        other.op.label().to_lowercase()
+                    );
+                    if !job.warnings.contains(&msg) {
+                        job.warnings.push(msg);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// True when every vertex of `inner` lies inside or on `outer`.
+fn fully_inside(inner: &Shape, outer: &Shape) -> bool {
+    let Some((amn, amx)) = inner.bbox() else { return false };
+    let Some((bmn, bmx)) = outer.bbox() else { return false };
+    if amn[0] < bmn[0] - 0.05 || amn[1] < bmn[1] - 0.05 || amx[0] > bmx[0] + 0.05 || amx[1] > bmx[1] + 0.05 {
+        return false;
+    }
+    inner.paths.iter().flat_map(|p| p.pts.iter()).all(|p| geom::inside_shape(outer, *p) || geom::outline_dist(outer, *p) <= 0.05)
+}
+
+/// A closed-outline warning plus the exact spots that caused it.
+/// When a region still exists, the toolpath runs on the closed shapes and the
+/// warning says that the open ones were ignored instead of claiming nothing can run.
+fn closed_shape_warning(job: &mut Job, doc: &Document, tp_index: usize, region_empty: bool, empty: String, partial: String) {
+    let issues = crate::diagnostics::closed_shape_issues(doc, tp_index);
+    if issues.is_empty() {
+        if region_empty {
+            job.warnings.push(empty);
+        }
+        return;
+    }
+    let hint = issues.first().map(|i| i.hint.clone()).unwrap_or_default();
+    let base = if region_empty { empty } else { partial };
+    job.warnings.push(if hint.is_empty() { base } else { format!("{base} {hint}.") });
+    job.issues.extend(issues);
 }
 
 struct Emitter {
@@ -740,8 +797,15 @@ pub fn generate(inp: &CamInput) -> Job {
         match tp.op {
             OpKind::ProfileOutside | OpKind::ProfileInside => {
                 let region = geom::region_of(shapes.iter().copied());
+                closed_shape_warning(
+                    &mut job,
+                    doc,
+                    ti,
+                    region.0.is_empty(),
+                    format!("{}: profiles need closed shapes.", tp.name),
+                    format!("{}: profiles ignored some open shapes.", tp.name),
+                );
                 if region.0.is_empty() {
-                    job.warnings.push(format!("{}: profiles need closed shapes.", tp.name));
                     continue;
                 }
                 let outside = tp.op == OpKind::ProfileOutside;
@@ -863,8 +927,15 @@ pub fn generate(inp: &CamInput) -> Job {
             }
             OpKind::Pocket => {
                 let region = geom::region_of(shapes.iter().copied());
+                closed_shape_warning(
+                    &mut job,
+                    doc,
+                    ti,
+                    region.0.is_empty(),
+                    format!("{}: pockets need closed shapes.", tp.name),
+                    format!("{}: pockets ignored some open shapes.", tp.name),
+                );
                 if region.0.is_empty() {
-                    job.warnings.push(format!("{}: pockets need closed shapes.", tp.name));
                     continue;
                 }
                 let base = geom::offset_region(&region, -(r + tp.allowance));
@@ -1055,10 +1126,18 @@ pub fn generate(inp: &CamInput) -> Job {
                 let rings: Vec<(Vec<P>, bool)> = if shapes.is_empty() {
                     vec![(vec![[0.0, 0.0], [doc.stock.width, 0.0], [doc.stock.width, doc.stock.height], [0.0, doc.stock.height]], true)]
                 } else {
-                    rings_of(&geom::region_of(shapes.iter().copied()))
+                    let region = geom::region_of(shapes.iter().copied());
+                    closed_shape_warning(
+                        &mut job,
+                        doc,
+                        ti,
+                        region.0.is_empty(),
+                        format!("{}: texture needs closed shapes (or none, for the whole stock).", tp.name),
+                        format!("{}: texture ignored some open shapes.", tp.name),
+                    );
+                    rings_of(&region)
                 };
                 if rings.is_empty() {
-                    job.warnings.push(format!("{}: texture needs closed shapes (or none, for the whole stock).", tp.name));
                     continue;
                 }
                 let step = (tool.diameter * tp.stepover_pct / 100.0).max(0.2);
@@ -1140,8 +1219,15 @@ pub fn generate(inp: &CamInput) -> Job {
             }
             OpKind::VCarve => {
                 let region = geom::region_of(shapes.iter().copied());
+                closed_shape_warning(
+                    &mut job,
+                    doc,
+                    ti,
+                    region.0.is_empty(),
+                    format!("{}: V-carving needs closed shapes.", tp.name),
+                    format!("{}: V-carving ignored some open shapes.", tp.name),
+                );
                 if region.0.is_empty() {
-                    job.warnings.push(format!("{}: V-carving needs closed shapes.", tp.name));
                     continue;
                 }
                 let half = (tool.angle.clamp(10.0, 170.0) / 2.0).to_radians();
@@ -1169,8 +1255,15 @@ pub fn generate(inp: &CamInput) -> Job {
             OpKind::Prism => {
                 // a V-bit along the outline: its sloped side bevels the shape up to a ridge in the middle
                 let region = geom::region_of(shapes.iter().copied());
+                closed_shape_warning(
+                    &mut job,
+                    doc,
+                    ti,
+                    region.0.is_empty(),
+                    format!("{}: prisms need closed shapes.", tp.name),
+                    format!("{}: prisms ignored some open shapes.", tp.name),
+                );
                 if region.0.is_empty() {
-                    job.warnings.push(format!("{}: prisms need closed shapes.", tp.name));
                     continue;
                 }
                 if tool.kind != ToolKind::VBit {
@@ -1382,8 +1475,15 @@ pub fn generate(inp: &CamInput) -> Job {
             OpKind::Dogbone => {
                 // a pocket (or just its outline) with a notch into every corner the round bit can't reach
                 let region = geom::region_of(shapes.iter().copied());
+                closed_shape_warning(
+                    &mut job,
+                    doc,
+                    ti,
+                    region.0.is_empty(),
+                    format!("{}: dogbone slots need closed shapes.", tp.name),
+                    format!("{}: dogbone slots ignored some open shapes.", tp.name),
+                );
                 if region.0.is_empty() {
-                    job.warnings.push(format!("{}: dogbone slots need closed shapes.", tp.name));
                     continue;
                 }
                 let base = geom::offset_region(&region, -(r + tp.allowance));
@@ -1644,6 +1744,7 @@ pub fn generate(inp: &CamInput) -> Job {
         }
         pos = [m.x, m.y, m.z];
     }
+    nested_profile_warnings(doc, &mut job);
     job.gcode = gcode(inp, &job);
     job
 }
@@ -1957,4 +2058,56 @@ pub fn frame_gcode(job: &Job, doc: &Document, m: &MachineSettings) -> Vec<String
         format!("G1 X{} Y{}", f(mn[0] + off[0]), f(mx[1] + off[1])),
         format!("G1 X{} Y{}", f(mn[0] + off[0]), f(mn[1] + off[1])),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{default_tools, MachineSettings, ShapeKind};
+
+    fn rect_shape(doc: &mut Document, a: P, b: P) -> u64 {
+        let id = doc.new_id();
+        doc.shapes.push(Shape { id, kind: ShapeKind::Path, paths: vec![crate::geom::rect_path(a, b, 0.0)], group: None, text: None, fx: None });
+        id
+    }
+
+    #[test]
+    fn a_nested_shape_in_an_outside_profile_warns_about_the_pocket_edge() {
+        let mut doc = Document::default();
+        let outer = rect_shape(&mut doc, [0.0, 0.0], [100.0, 100.0]);
+        let inner = rect_shape(&mut doc, [30.0, 30.0], [70.0, 70.0]);
+        let tools = default_tools();
+        let tool = &tools[0];
+        let mut pocket = Toolpath::new(1, OpKind::Pocket, tool, vec![inner], 0);
+        pocket.cut_depth = 3.0;
+        let mut profile = Toolpath::new(2, OpKind::ProfileOutside, tool, vec![outer, inner], 1);
+        profile.cut_depth = 16.0;
+        doc.toolpaths.push(pocket);
+        doc.toolpaths.push(profile);
+        let machine = MachineSettings::default();
+        let job = generate(&CamInput { doc: &doc, tools: &tools, machine: &machine });
+        assert!(
+            job.warnings.iter().any(|w| w.contains("also cuts around Pocket 1 at full depth")),
+            "expected the nested-profile warning, got {:?}",
+            job.warnings
+        );
+    }
+
+    #[test]
+    fn a_profile_with_only_the_outer_shape_does_not_warn() {
+        let mut doc = Document::default();
+        let outer = rect_shape(&mut doc, [0.0, 0.0], [100.0, 100.0]);
+        let inner = rect_shape(&mut doc, [30.0, 30.0], [70.0, 70.0]);
+        let tools = default_tools();
+        let tool = &tools[0];
+        let mut pocket = Toolpath::new(1, OpKind::Pocket, tool, vec![inner], 0);
+        pocket.cut_depth = 3.0;
+        let mut profile = Toolpath::new(2, OpKind::ProfileOutside, tool, vec![outer], 1);
+        profile.cut_depth = 16.0;
+        doc.toolpaths.push(pocket);
+        doc.toolpaths.push(profile);
+        let machine = MachineSettings::default();
+        let job = generate(&CamInput { doc: &doc, tools: &tools, machine: &machine });
+        assert!(!job.warnings.iter().any(|w| w.contains("also cuts around")), "{:?}", job.warnings);
+    }
 }

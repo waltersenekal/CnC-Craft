@@ -255,13 +255,18 @@ impl App {
     pub fn regenerate(&mut self) {
         let inp = cam::CamInput { doc: &self.doc, tools: &self.settings.tools, machine: &self.settings.machine };
         self.job = cam::generate(&inp);
+        self.job_epoch = self.job_epoch.wrapping_add(1);
         self.job_dirty = false;
         self.sim = None;
         self.sim_travel = sim::travel(&self.job);
+        // Keep the mark on the same problem (following edits), or drop it if that
+        // problem was just fixed.
+        let focus_key = self.design.issue_focus.as_ref().map(|f| f.key.clone());
+        self.design.issue_focus = focus_key.and_then(|key| self.job.issues.iter().find(|i| i.key == key).cloned());
     }
 
     pub fn reset_sim(&mut self) {
-        let mut s = Sim::new(&self.doc.stock, 160_000);
+        let mut s = Sim::new(&self.doc.stock, 800_000);
         s.dirty = true;
         self.sim = Some(s);
     }

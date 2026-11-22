@@ -19,6 +19,7 @@
 ### Design
 - **Drawing tools:** lines, rectangles, ellipses and circles, polygons, stars, text in any installed font, drill points, measuring and dimension lines.
 - **Editing:** point editing, trim, knife, shape builder, round and chamfered corners, weld, subtract, intersect, exclude, offset, outlines, join, break apart, simplify.
+- **Selecting:** double-click a line to take its whole touching outline in one go, then Ctrl+G to group it; Shift adds the run to the current selection.
 - **Precise placement:** a number bar for position, size, rotation and scale, plus snapping to the grid and to other objects, ruler guides, smart guides, symmetry drawing, alignment and spacing, grid and circular arrays, and nesting to fit parts on the stock with little waste.
 - **Live effects:** offset, rounded corners, warp, envelope, simplify, smooth and radial repeat stay editable, so you can change them later.
 - **Modify tools:** warp, smooth, hatch fill, lattice, dot and hole templates, knockouts and inlays, stencil bridges, shadows, radial repeat, blend, clip, copy along a path and fit into a shape.
@@ -49,8 +50,9 @@ Import a greyscale picture (PNG or JPG, white is high) or a 3D model (STL) as a 
 - **Feeds and speeds calculator:** choose the material and how stiff your machine is, and CncCraft suggests spindle speed, feed, plunge, depth per pass and stepover.
 
 ### Preview and checks
-- A cut preview that removes material as the job plays, viewed from the top, in 3D, or as front and side sections.
+- A cut preview that removes material as the job plays, viewed from the top, in a shaded 3D view, or as front and side sections. Every view pans and zooms, and the preview can be maximized to fill the window. The 3D view has soft lighting, wood grain and a contact shadow; flat-ended pocket and through-profile cuts are drawn from the exact shape outlines, with pocket corners rounded by the bit radius, giving smooth walls and the floor corners the bit actually leaves (a through profile shows the finished part; use Top/Front/Side for the stock and waste), while V-carve and ball-nose cuts keep their shaped edges. Turn on **Compare** in the 3D view to overlay the drawing outline, the actual cut edge and the material left at the corners.
 - **Checks before cutting** catch rapid moves into material, cuts outside the stock or deeper than the bit's flutes, parts that will come loose, clamps in the way, and jobs bigger than the machine.
+- A warning about shapes that are not closed points at the exact open end, gap or unjoined corner: **double-click the warning** (or the status bar) to zoom in, then press **Fix: Join…** or **Fix: Close…** to repair it, and double-click again to step through any remaining problems.
 
 ### Machine control
 - Connect over USB serial, or try everything with the **built-in simulator**.
@@ -77,6 +79,7 @@ cargo build --release
 ```
 
 The program is built as `target/release/cnccraft.exe` (on Windows the icon and version details are built in). Run the tests with `cargo test --release`.
+On Linux, run `./target/release/cnccraft --install-desktop` once: it installs a menu entry and the icon into `~/.local/share`, which Wayland panels and task bars use to show the CncCraft icon instead of the generic Wayland icon.
 
 ### Your first job, in a few steps
 1. **Setup** (right-hand ribbon): enter the stock size and thickness, and where X/Y and Z zero are.

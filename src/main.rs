@@ -7,6 +7,8 @@ mod canvas;
 mod checks;
 mod chrome;
 mod design;
+mod desktop;
+mod diagnostics;
 mod effects;
 mod design_ui;
 mod geom;
@@ -36,6 +38,7 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut screenshot: Option<std::path::PathBuf> = None;
     let mut open: Option<std::path::PathBuf> = None;
+    let mut install_desktop = false;
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--screenshot" && i + 1 < args.len() {
@@ -43,8 +46,26 @@ fn main() -> eframe::Result<()> {
             i += 2;
             continue;
         }
+        if args[i] == "--install-desktop" {
+            install_desktop = true;
+            i += 1;
+            continue;
+        }
         open = Some(args[i].clone().into());
         i += 1;
+    }
+    if install_desktop {
+        return match desktop::install() {
+            Ok(path) => {
+                println!("Installed the CncCraft desktop entry at {}", path.display());
+                println!("The next normal launch will show the CncCraft icon in the panel and task bar.");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("Could not install the desktop icon: {e}");
+                std::process::exit(1);
+            }
+        };
     }
     if let Ok(p) = std::env::var("CNCCRAFT_ICON_PNG") {
         // testing helper: write the icon as a picture and stop
@@ -52,7 +73,9 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     let options = eframe::NativeOptions {
+        multisampling: 4,
         viewport: egui::ViewportBuilder::default()
+            .with_app_id("cnccraft")
             .with_title("CncCraft")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([900.0, 600.0])
