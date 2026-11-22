@@ -78,6 +78,7 @@ cargo build --release
 ```
 
 The program is built as `target/release/cnccraft.exe` (on Windows the icon and version details are built in). Run the tests with `cargo test --release`.
+On Linux, run `./target/release/cnccraft --install-desktop` once: it installs a menu entry and the icon into `~/.local/share`, which Wayland panels and task bars use to show the CncCraft icon instead of the generic Wayland icon.
 
 ### Your first job, in a few steps
 1. **Setup** (right-hand ribbon): enter the stock size and thickness, and where X/Y and Z zero are.
