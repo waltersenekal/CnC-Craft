@@ -542,6 +542,19 @@ impl App {
         if std::env::var("CNCCRAFT_SIM").is_ok() {
             app.machine.send(crate::machine::Cmd::Connect(machine::SIMULATOR.into(), 115200));
         }
+        if let Ok(which) = std::env::var("CNCCRAFT_ISSUE") {
+            // test hook: two broken outlines and a pocket, framed on the first problem
+            // ("2" frames the second; "fix" repairs the first; "fix2" repairs both)
+            app.broken_outline_design();
+            if which == "2" || which == "fix2" {
+                app.focus_next_issue(None);
+            }
+            if which == "fix" || which == "fix2" {
+                if let Some(issue) = app.design.issue_focus.clone() {
+                    app.fix_issue(&issue);
+                }
+            }
+        }
         app
     }
 
@@ -595,6 +608,44 @@ impl App {
         self.job_dirty = true;
         self.needs_fit = true;
         self.project_path = None;
+    }
+
+    /// Test hook: a pocket over an unjoined DXF-like rectangle and an outline with a
+    /// 2 mm gap, framed on the first problem.
+    pub fn broken_outline_design(&mut self) {
+        let mut d = Document::default();
+        d.stock = Stock { width: 300.0, height: 200.0, ..Stock::default() };
+        let mut ids = vec![];
+        let lines = |a: P, b: P, d: &mut Document, ids: &mut Vec<u64>| {
+            let id = d.new_id();
+            d.shapes.push(Shape { id, kind: ShapeKind::Path, paths: vec![Path { pts: vec![a, b], closed: false }], group: None, text: None, fx: None });
+            ids.push(id);
+        };
+        for (a, b) in [([20.0, 20.0], [120.0, 20.0]), ([120.0, 20.0], [120.0, 100.0]), ([120.0, 100.0], [20.0, 100.0]), ([20.0, 100.0], [20.0, 20.0])] {
+            lines(a, b, &mut d, &mut ids);
+        }
+        let id = d.new_id();
+        d.shapes.push(Shape {
+            id,
+            kind: ShapeKind::Path,
+            paths: vec![Path { pts: vec![[160.0, 20.0], [280.0, 20.0], [280.0, 100.0], [160.0, 100.0], [160.0, 22.0]], closed: false }],
+            group: None,
+            text: None,
+            fx: None,
+        });
+        ids.push(id);
+        let tool = self.settings.tools.iter().find(|t| t.kind == ToolKind::FlatEnd).cloned().unwrap_or_else(|| self.settings.tools[0].clone());
+        let tp_id = d.new_id();
+        let mut tp = Toolpath::new(tp_id, OpKind::Pocket, &tool, ids, 0);
+        tp.name = "Pocket 1".into();
+        d.toolpaths.push(tp);
+        self.selected_tp = Some(tp_id);
+        self.right_tab = RightTab::Toolpaths;
+        self.doc = d;
+        self.job_dirty = true;
+        self.regenerate();
+        self.design.canvas_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 760.0)));
+        self.focus_next_issue(None);
     }
 
     // ---------- undo ----------

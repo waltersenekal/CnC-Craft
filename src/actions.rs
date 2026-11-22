@@ -258,6 +258,10 @@ impl App {
         self.job_dirty = false;
         self.sim = None;
         self.sim_travel = sim::travel(&self.job);
+        // Keep the mark on the same problem (following edits), or drop it if that
+        // problem was just fixed.
+        let focus_key = self.design.issue_focus.as_ref().map(|f| f.key.clone());
+        self.design.issue_focus = focus_key.and_then(|key| self.job.issues.iter().find(|i| i.key == key).cloned());
     }
 
     pub fn reset_sim(&mut self) {

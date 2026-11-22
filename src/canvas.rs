@@ -806,6 +806,38 @@ impl App {
             }
         }
 
+        // the spot a double-clicked warning points at
+        if let Some(issue) = &self.design.issue_focus {
+            let col = issue.color();
+            for p in &issue.highlights {
+                let pts: Vec<Pos2> = p.pts.iter().map(|q| ts(*q)).collect();
+                if pts.len() < 2 {
+                    continue;
+                }
+                if p.closed {
+                    painter.add(egui::Shape::closed_line(pts, Stroke::new(3.0f32, col)));
+                } else {
+                    painter.add(egui::Shape::line(pts, Stroke::new(3.0f32, col)));
+                }
+            }
+            if let Some((a, b)) = issue.gap {
+                let (sa, sb) = (ts(a), ts(b));
+                if sa.distance(sb) > 0.5 {
+                    painter.extend(egui::Shape::dashed_line(&[sa, sb], Stroke::new(2.0f32, col), 6.0, 4.0));
+                }
+                painter.circle_filled(sa, 3.5, col);
+                painter.circle_filled(sb, 3.5, col);
+            }
+            if let Some(m) = issue.marker {
+                let c = ts(m);
+                painter.circle_stroke(c, 16.0, Stroke::new(2.0f32, col));
+                painter.circle_stroke(c, 23.0, Stroke::new(1.0f32, col.gamma_multiply(0.55)));
+                painter.line_segment([c - egui::vec2(6.0, 0.0), c + egui::vec2(6.0, 0.0)], Stroke::new(1.5f32, col));
+                painter.line_segment([c - egui::vec2(0.0, 6.0), c + egui::vec2(0.0, 6.0)], Stroke::new(1.5f32, col));
+                painter.text(Pos2::new(c.x, c.y - 27.0), egui::Align2::CENTER_BOTTOM, "problem", egui::FontId::proportional(11.0), col);
+            }
+        }
+
         // selection box, handles and points
         if let Some((mn, mx)) = self.selection_bbox() {
             let r = Rect::from_two_pos(ts(mn), ts(mx)).expand(4.0);

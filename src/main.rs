@@ -7,6 +7,7 @@ mod canvas;
 mod checks;
 mod chrome;
 mod design;
+mod diagnostics;
 mod effects;
 mod design_ui;
 mod geom;

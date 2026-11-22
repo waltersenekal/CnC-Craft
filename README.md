@@ -51,6 +51,7 @@ Import a greyscale picture (PNG or JPG, white is high) or a 3D model (STL) as a 
 ### Preview and checks
 - A cut preview that removes material as the job plays, viewed from the top, in 3D, or as front and side sections.
 - **Checks before cutting** catch rapid moves into material, cuts outside the stock or deeper than the bit's flutes, parts that will come loose, clamps in the way, and jobs bigger than the machine.
+- A warning about shapes that are not closed points at the exact open end, gap or unjoined corner: **double-click the warning** (or the status bar) to zoom in, then press **Fix: Join…** or **Fix: Close…** to repair it, and double-click again to step through any remaining problems.
 
 ### Machine control
 - Connect over USB serial, or try everything with the **built-in simulator**.

@@ -762,8 +762,29 @@ impl App {
             self.status = format!("Template \"{}\" saved", tp.name);
         }
         let warn: Vec<String> = self.job.warnings.iter().filter(|w| w.starts_with(&format!("{}:", tp.name))).cloned().collect();
+        let has_issue = self.job.issues.iter().any(|i| i.toolpath_id == tp.id);
         for w in warn {
-            ui.label(RichText::new(format!("⚠ {w}")).color(Color32::from_rgb(250, 200, 70)));
+            let text = RichText::new(format!("⚠ {w}")).color(Color32::from_rgb(250, 200, 70));
+            if has_issue {
+                let r = ui
+                    .add(egui::Label::new(text).sense(Sense::click()))
+                    .on_hover_text("Double-click to zoom in on the first problem. Double-click again for the next one.");
+                if r.double_clicked() {
+                    self.focus_next_issue(Some(tp.id));
+                }
+            } else {
+                ui.label(text);
+            }
+        }
+        if has_issue {
+            let fix = self.job.issues.iter().filter(|i| i.toolpath_id == tp.id).find(|i| i.fix_label().is_some()).cloned();
+            if let Some(issue) = fix {
+                if let Some(label) = issue.fix_label() {
+                    if ui.add(egui::Button::new(format!("Fix: {label}")).small()).on_hover_text("Apply this repair to the highlighted shapes").clicked() {
+                        self.fix_issue(&issue);
+                    }
+                }
+            }
         }
     }
 

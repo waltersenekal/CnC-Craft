@@ -75,6 +75,8 @@ pub struct DesignState {
     pub checks: Vec<(bool, String)>,
     pub checks_pending: Option<crate::checks::Pending>,
     pub checks_bypass: bool,
+    /// The problem the last warning double-click framed.
+    pub issue_focus: Option<crate::diagnostics::Issue>,
     pub modify: crate::modify_ui::ModifyState,
     pub builder: Option<(u64, Vec<u64>, Vec<geo::Polygon<f64>>)>,
     pub chamfer: bool,
@@ -200,6 +202,7 @@ impl Default for DesignState {
             checks: vec![],
             checks_pending: None,
             checks_bypass: false,
+            issue_focus: None,
             modify: Default::default(),
             builder: None,
             chamfer: false,
