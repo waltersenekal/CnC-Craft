@@ -6,6 +6,84 @@ use crate::model::*;
 use egui::{Color32, PointerButton, Pos2, Rect, Sense, Stroke};
 
 const RULER: f32 = 20.0;
+/// Paths whose ends are this close count as joined when picking a connected run.
+const CONNECT_TOL: f64 = 0.05;
+
+/// The line segments of a path, including the closing edge of a closed path.
+fn path_segments(p: &Path) -> impl Iterator<Item = (P, P)> + '_ {
+    let windows = p.pts.windows(2).map(|w| (w[0], w[1]));
+    let closing = if p.closed && p.pts.len() > 2 { Some((*p.pts.last().unwrap(), p.pts[0])) } else { None };
+    windows.chain(closing)
+}
+
+/// True when any vertex of `from` lies on an edge of `to` (within `tol`).
+fn vertex_near_edges(from: &Shape, to: &Shape, tol: f64) -> bool {
+    for path in &from.paths {
+        for p in &path.pts {
+            for edge in &to.paths {
+                for (a, b) in path_segments(edge) {
+                    if geom::seg_dist(*p, a, b) <= tol {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// True when two straight segments cross, so outlines touching anywhere count.
+fn segments_cross(a: P, b: P, c: P, d: P) -> bool {
+    let turn = |p: P, q: P, r: P| (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+    let (o1, o2, o3, o4) = (turn(a, b, c), turn(a, b, d), turn(c, d, a), turn(c, d, b));
+    (o1 > 0.0) != (o2 > 0.0) && (o3 > 0.0) != (o4 > 0.0)
+}
+
+/// Two shapes are connected when any of their vertices touch the other's outline
+/// (including a T-junction) or when their outlines cross.
+fn shapes_touch(a: &Shape, b: &Shape, tol: f64) -> bool {
+    let (Some((amn, amx)), Some((bmn, bmx))) = (a.bbox(), b.bbox()) else { return false };
+    if amx[0] + tol < bmn[0] || bmx[0] + tol < amn[0] || amx[1] + tol < bmn[1] || bmx[1] + tol < amn[1] {
+        return false;
+    }
+    if vertex_near_edges(a, b, tol) || vertex_near_edges(b, a, tol) {
+        return true;
+    }
+    for pa in &a.paths {
+        for (a1, a2) in path_segments(pa) {
+            for pb in &b.paths {
+                for (b1, b2) in path_segments(pb) {
+                    if segments_cross(a1, a2, b1, b2) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Every shape connected to `seed`, excluding ids rejected by `skip`.
+fn connected_shape_ids(shapes: &[Shape], seed: u64, tol: f64, skip: impl Fn(u64) -> bool) -> Vec<u64> {
+    let Some(start) = shapes.iter().position(|s| s.id == seed) else { return vec![] };
+    let mut seen = vec![false; shapes.len()];
+    let mut stack = vec![start];
+    seen[start] = true;
+    let mut out = vec![];
+    while let Some(i) = stack.pop() {
+        out.push(shapes[i].id);
+        for j in 0..shapes.len() {
+            if seen[j] || skip(shapes[j].id) {
+                continue;
+            }
+            if shapes_touch(&shapes[i], &shapes[j], tol) {
+                seen[j] = true;
+                stack.push(j);
+            }
+        }
+    }
+    out
+}
 
 impl App {
     pub fn to_screen(&self, rect: Rect, p: P) -> Pos2 {
@@ -110,6 +188,40 @@ impl App {
         if hits.len() > 1 {
             self.status = format!("Shape {} of {} under the pointer - click again to pick the one behind", idx + 1, hits.len());
         }
+    }
+
+    /// Shapes joined end-to-end to `seed` (locked shapes and clamps stay out of the run).
+    fn connected_ids(&self, seed: u64) -> Vec<u64> {
+        connected_shape_ids(&self.doc.shapes, seed, CONNECT_TOL, |id| self.doc.locked.contains(&id) || self.doc.keepout.contains(&id))
+    }
+
+    /// Double-click selection: take the whole touching outline/chain, ready to group.
+    fn select_connected_at(&mut self, p: P, tol: f64, add: bool) {
+        let Some(seed) = self.hit_shape(p, tol) else {
+            if !add {
+                self.selection.clear();
+            }
+            self.status = "Nothing under the pointer to select".into();
+            return;
+        };
+        let ids = self.connected_ids(seed);
+        if add {
+            for id in ids {
+                if !self.selection.contains(&id) {
+                    self.selection.push(id);
+                }
+            }
+        } else {
+            self.selection = ids;
+        }
+        self.design.click_cycle = None;
+        let n = self.selection.len();
+        self.status = if n > 1 {
+            let key = if cfg!(target_os = "macos") { "Cmd+G" } else { "Ctrl+G" };
+            format!("{n} connected shapes selected - press {key} to group them")
+        } else {
+            "1 shape selected - nothing else touches it".into()
+        };
     }
 
     fn hit_node(&self, p: P, tol: f64) -> Option<(u64, usize, usize)> {
@@ -486,7 +598,16 @@ impl App {
         }
 
         // ---- clicks ----
-        if resp.clicked_by(PointerButton::Primary) && !space {
+        // A double-click on a line takes its whole touching run, so an ungrouped DXF
+        // outline can be selected in one go. The single click on the first half of the
+        // double-click already picked the seed; this replaces it with the run.
+        let connected_double = !space && self.tool == CanvasTool::Select && resp.double_clicked();
+        if connected_double {
+            if let Some(p) = pointer {
+                self.select_connected_at(p, tol, shift);
+            }
+        }
+        if resp.clicked_by(PointerButton::Primary) && !space && !connected_double {
             if let Some(p) = pointer {
                 match self.tool {
                     CanvasTool::Select | CanvasTool::Nodes => {
@@ -1075,5 +1196,57 @@ impl App {
             painter.line_segment([Pos2::new(left.left(), p.y), Pos2::new(left.right(), p.y)], s);
             painter.line_segment([Pos2::new(right.left(), p.y), Pos2::new(right.right(), p.y)], s);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(id: u64, a: P, b: P) -> Shape {
+        Shape { id, kind: ShapeKind::Path, paths: vec![Path { pts: vec![a, b], closed: false }], group: None, text: None, fx: None }
+    }
+
+    #[test]
+    fn a_connected_outline_is_taken_as_one_run() {
+        let shapes = vec![
+            line(1, [0.0, 0.0], [10.0, 0.0]),
+            line(2, [10.0, 0.0], [10.0, 10.0]),
+            line(3, [10.0, 10.0], [0.0, 10.0]),
+            line(4, [0.0, 10.0], [0.0, 0.0]),
+            line(5, [30.0, 30.0], [40.0, 30.0]),
+        ];
+        let mut got = connected_shape_ids(&shapes, 1, CONNECT_TOL, |_| false);
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3, 4], "the separate line must stay out");
+    }
+
+    #[test]
+    fn a_gap_breaks_the_connected_run() {
+        let shapes = vec![line(1, [0.0, 0.0], [10.0, 0.0]), line(2, [10.0, 0.0], [10.0, 10.0]), line(3, [10.0, 10.0], [0.0, 10.0]), line(4, [3.0, 5.0], [7.0, 5.0])];
+        let mut got = connected_shape_ids(&shapes, 1, CONNECT_TOL, |_| false);
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn the_sample_dxf_double_click_finds_the_eighteen_line_outline() {
+        let imported = crate::io::import_dxf(include_str!("../samples/micrometer_stencil_lines_not_joined.dxf")).expect("sample imports");
+        let shapes: Vec<Shape> = imported
+            .into_iter()
+            .enumerate()
+            .map(|(i, paths)| Shape { id: i as u64 + 1, kind: ShapeKind::Imported, paths, group: None, text: None, fx: None })
+            .collect();
+        let mut sizes: Vec<usize> = shapes.iter().map(|s| connected_shape_ids(&shapes, s.id, CONNECT_TOL, |_| false).len()).collect();
+        sizes.sort_unstable();
+        sizes.dedup();
+        assert_eq!(sizes, vec![4, 18], "the sample has a 4-line piece and the 18-line stencil outline");
+    }
+
+    #[test]
+    fn crossing_lines_count_as_touching() {
+        let shapes = vec![line(1, [0.0, 0.0], [10.0, 10.0]), line(2, [0.0, 10.0], [10.0, 0.0])];
+        assert!(shapes_touch(&shapes[0], &shapes[1], CONNECT_TOL));
+        assert_eq!(connected_shape_ids(&shapes, 1, CONNECT_TOL, |_| false).len(), 2);
     }
 }

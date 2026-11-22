@@ -19,6 +19,7 @@
 ### Design
 - **Drawing tools:** lines, rectangles, ellipses and circles, polygons, stars, text in any installed font, drill points, measuring and dimension lines.
 - **Editing:** point editing, trim, knife, shape builder, round and chamfered corners, weld, subtract, intersect, exclude, offset, outlines, join, break apart, simplify.
+- **Selecting:** double-click a line to take its whole touching outline in one go, then Ctrl+G to group it; Shift adds the run to the current selection.
 - **Precise placement:** a number bar for position, size, rotation and scale, plus snapping to the grid and to other objects, ruler guides, smart guides, symmetry drawing, alignment and spacing, grid and circular arrays, and nesting to fit parts on the stock with little waste.
 - **Live effects:** offset, rounded corners, warp, envelope, simplify, smooth and radial repeat stay editable, so you can change them later.
 - **Modify tools:** warp, smooth, hatch fill, lattice, dot and hole templates, knockouts and inlays, stencil bridges, shadows, radial repeat, blend, clip, copy along a path and fit into a shape.
