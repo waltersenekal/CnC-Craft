@@ -394,27 +394,10 @@ impl App {
                 let grain = (((x * 0.33 + (y * 2.1).sin() * 1.2).sin()) * 0.5 + 0.5) * 8.0;
                 lit(n, [152.0 - depth * 26.0 - grain, 114.0 - depth * 22.0 - grain * 0.8, 72.0 - depth * 16.0 - grain * 0.5])
             };
-            let regions = std::iter::once((&model.top, 0.0f32)).chain(model.floors.iter().map(|(m, z)| (m, *z)));
-            for (mp, z) in regions {
-                for poly in &mp.0 {
-                    for tri in poly.earcut_triangles() {
-                        let mut p = [(Pos2::ZERO, 0.0f32); 3];
-                        let mut c = [Color32::BLACK; 3];
-                        for (k, q) in [tri.v1(), tri.v2(), tri.v3()].into_iter().enumerate() {
-                            p[k] = project(q.x as f32, q.y as f32, z);
-                            c[k] = top_col(q.x as f32, q.y as f32, z);
-                        }
-                        let base = verts.len() as u32;
-                        for k in 0..3 {
-                            verts.push(egui::epaint::Vertex { pos: p[k].0, uv: egui::epaint::WHITE_UV, color: c[k] });
-                            vdepth.push(p[k].1);
-                        }
-                        let d = (p[0].1 + p[1].1 + p[2].1) / 3.0;
-                        tris.push((d, [base, base + 1, base + 2]));
-                    }
-                }
-            }
-            let wall_regions = model.pocket_walls.iter().map(|(m, z)| (m, *z)).chain(std::iter::once((&model.outer, bottom)));
+            // Painter order for a part seen from above: outside walls, pocket walls,
+            // pocket floors, then the top surface last. Sorting these large triangles
+            // by average depth makes the top disappear in patches.
+            let wall_regions = std::iter::once((&model.outer, bottom)).chain(model.pocket_walls.iter().map(|(m, z)| (m, *z)));
             for (mp, z_bottom) in wall_regions {
                 if -z_bottom <= 0.005 {
                     continue;
@@ -437,6 +420,26 @@ impl App {
                             let c = [wall_col(a[0], a[1], 0.0, n), wall_col(b[0], b[1], 0.0, n), wall_col(b[0], b[1], z_bottom, n), wall_col(a[0], a[1], z_bottom, n)];
                             push_quad(&mut verts, &mut vdepth, &mut tris, p, c);
                         }
+                    }
+                }
+            }
+            let regions = model.floors.iter().map(|(m, z)| (m, *z)).chain(std::iter::once((&model.top, 0.0f32)));
+            for (mp, z) in regions {
+                for poly in &mp.0 {
+                    for tri in poly.earcut_triangles() {
+                        let mut p = [(Pos2::ZERO, 0.0f32); 3];
+                        let mut c = [Color32::BLACK; 3];
+                        for (k, q) in [tri.v1(), tri.v2(), tri.v3()].into_iter().enumerate() {
+                            p[k] = project(q.x as f32, q.y as f32, z);
+                            c[k] = top_col(q.x as f32, q.y as f32, z);
+                        }
+                        let base = verts.len() as u32;
+                        for k in 0..3 {
+                            verts.push(egui::epaint::Vertex { pos: p[k].0, uv: egui::epaint::WHITE_UV, color: c[k] });
+                            vdepth.push(p[k].1);
+                        }
+                        let d = (p[0].1 + p[1].1 + p[2].1) / 3.0;
+                        tris.push((d, [base, base + 1, base + 2]));
                     }
                 }
             }
@@ -686,7 +689,9 @@ impl App {
             }
         }
 
-        tris.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if !has_vector {
+            tris.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
         let mut mesh = egui::epaint::Mesh::default();
         mesh.vertices = verts;
         for (_, t) in tris {
@@ -829,5 +834,34 @@ impl App {
         let end = to(length, -thick);
         painter.text(Pos2::new(end.x, end.y + 14.0), egui::Align2::RIGHT_TOP, format!("{axis} {}", self.len_text(length)), f, txt);
         paint_preview_hint(&painter, rect, "Drag to pan · scroll to zoom · double-click to fit");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ProjectFile;
+    use geo::Area;
+
+    #[test]
+    fn the_project_top_outline_triangulates_without_gaps() {
+        let p: ProjectFile = serde_json::from_str(include_str!("../samples/project.ccraft")).unwrap();
+        let doc = &p.document;
+        let part = doc.shape(102).unwrap();
+        let pocket = doc.shape(106).unwrap();
+        let part_mp = crate::geom::region_of(std::iter::once(part));
+        let pocket_mp = crate::geom::region_of(std::iter::once(pocket));
+        let top = part_mp.difference(&pocket_mp);
+        let mut tri_area = 0.0;
+        let mut count = 0;
+        for poly in &top.0 {
+            for t in poly.earcut_triangles() {
+                let (a, b, c) = (t.v1(), t.v2(), t.v3());
+                tri_area += ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs() / 2.0;
+                count += 1;
+            }
+        }
+        assert!(count > 0);
+        assert!((tri_area - top.unsigned_area()).abs() < 1e-6, "the top has holes in its triangles: {tri_area} vs {}", top.unsigned_area());
     }
 }
