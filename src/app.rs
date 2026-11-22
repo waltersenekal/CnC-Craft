@@ -322,11 +322,12 @@ impl App {
             title: String::new(),
             design: Default::default(),
         };
-        // start with an empty stock; `--sample` (or the File menu) loads the sample job
+        // start with an empty stock; `--sample` (or the File menu) loads the sample job.
+        // A real file argument always wins over the preview/click test hooks.
+        let from_file = open.as_ref().filter(|p| p.to_string_lossy() != "--sample").is_some();
         let want_sample = open.as_ref().map(|p| p.to_string_lossy() == "--sample").unwrap_or(false)
-            || std::env::var("CNCCRAFT_MAKER").is_ok()
-            || std::env::var("CNCCRAFT_CLICK").is_ok()
-            || std::env::var("CNCCRAFT_PREVIEW").is_ok();
+            || (!from_file
+                && (std::env::var("CNCCRAFT_MAKER").is_ok() || std::env::var("CNCCRAFT_CLICK").is_ok() || std::env::var("CNCCRAFT_PREVIEW").is_ok()));
         if let Some(p) = open.filter(|p| p.to_string_lossy() != "--sample") {
             app.open_path(&p);
         }

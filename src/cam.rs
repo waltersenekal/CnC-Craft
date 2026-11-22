@@ -28,6 +28,44 @@ pub struct Job {
     pub cut_len: f64,
 }
 
+/// A profile outside that includes a nested shape also cuts around that shape at full
+/// depth. When the nested shape is meant to be an enclosed pocket, that silently cuts
+/// its wall away. Warn instead of changing the toolpath behind the user's back.
+fn nested_profile_warnings(doc: &Document, job: &mut Job) {
+    let shallow = |op: OpKind| matches!(op, OpKind::Pocket | OpKind::VCarve | OpKind::Prism | OpKind::Dogbone | OpKind::Bore);
+    for tp in doc.toolpaths.iter().filter(|t| t.enabled && t.op == OpKind::ProfileOutside) {
+        let shapes: Vec<&Shape> = tp.shape_ids.iter().filter_map(|id| doc.shape(*id)).collect();
+        for inner in &shapes {
+            for outer in &shapes {
+                if inner.id == outer.id || !fully_inside(inner, outer) {
+                    continue;
+                }
+                if let Some(other) = doc.toolpaths.iter().find(|t| t.enabled && shallow(t.op) && t.shape_ids.contains(&inner.id)) {
+                    let msg = format!(
+                        "{}: it also cuts around {} at full depth. If that shape should stay an enclosed {}, remove it from this profile or use Profile inside.",
+                        tp.name,
+                        other.name,
+                        other.op.label().to_lowercase()
+                    );
+                    if !job.warnings.contains(&msg) {
+                        job.warnings.push(msg);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// True when every vertex of `inner` lies inside or on `outer`.
+fn fully_inside(inner: &Shape, outer: &Shape) -> bool {
+    let Some((amn, amx)) = inner.bbox() else { return false };
+    let Some((bmn, bmx)) = outer.bbox() else { return false };
+    if amn[0] < bmn[0] - 0.05 || amn[1] < bmn[1] - 0.05 || amx[0] > bmx[0] + 0.05 || amx[1] > bmx[1] + 0.05 {
+        return false;
+    }
+    inner.paths.iter().flat_map(|p| p.pts.iter()).all(|p| geom::inside_shape(outer, *p) || geom::outline_dist(outer, *p) <= 0.05)
+}
+
 /// A closed-outline warning plus the exact spots that caused it.
 /// When a region still exists, the toolpath runs on the closed shapes and the
 /// warning says that the open ones were ignored instead of claiming nothing can run.
@@ -1706,6 +1744,7 @@ pub fn generate(inp: &CamInput) -> Job {
         }
         pos = [m.x, m.y, m.z];
     }
+    nested_profile_warnings(doc, &mut job);
     job.gcode = gcode(inp, &job);
     job
 }
@@ -2019,4 +2058,56 @@ pub fn frame_gcode(job: &Job, doc: &Document, m: &MachineSettings) -> Vec<String
         format!("G1 X{} Y{}", f(mn[0] + off[0]), f(mx[1] + off[1])),
         format!("G1 X{} Y{}", f(mn[0] + off[0]), f(mn[1] + off[1])),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{default_tools, MachineSettings, ShapeKind};
+
+    fn rect_shape(doc: &mut Document, a: P, b: P) -> u64 {
+        let id = doc.new_id();
+        doc.shapes.push(Shape { id, kind: ShapeKind::Path, paths: vec![crate::geom::rect_path(a, b, 0.0)], group: None, text: None, fx: None });
+        id
+    }
+
+    #[test]
+    fn a_nested_shape_in_an_outside_profile_warns_about_the_pocket_edge() {
+        let mut doc = Document::default();
+        let outer = rect_shape(&mut doc, [0.0, 0.0], [100.0, 100.0]);
+        let inner = rect_shape(&mut doc, [30.0, 30.0], [70.0, 70.0]);
+        let tools = default_tools();
+        let tool = &tools[0];
+        let mut pocket = Toolpath::new(1, OpKind::Pocket, tool, vec![inner], 0);
+        pocket.cut_depth = 3.0;
+        let mut profile = Toolpath::new(2, OpKind::ProfileOutside, tool, vec![outer, inner], 1);
+        profile.cut_depth = 16.0;
+        doc.toolpaths.push(pocket);
+        doc.toolpaths.push(profile);
+        let machine = MachineSettings::default();
+        let job = generate(&CamInput { doc: &doc, tools: &tools, machine: &machine });
+        assert!(
+            job.warnings.iter().any(|w| w.contains("also cuts around Pocket 1 at full depth")),
+            "expected the nested-profile warning, got {:?}",
+            job.warnings
+        );
+    }
+
+    #[test]
+    fn a_profile_with_only_the_outer_shape_does_not_warn() {
+        let mut doc = Document::default();
+        let outer = rect_shape(&mut doc, [0.0, 0.0], [100.0, 100.0]);
+        let inner = rect_shape(&mut doc, [30.0, 30.0], [70.0, 70.0]);
+        let tools = default_tools();
+        let tool = &tools[0];
+        let mut pocket = Toolpath::new(1, OpKind::Pocket, tool, vec![inner], 0);
+        pocket.cut_depth = 3.0;
+        let mut profile = Toolpath::new(2, OpKind::ProfileOutside, tool, vec![outer], 1);
+        profile.cut_depth = 16.0;
+        doc.toolpaths.push(pocket);
+        doc.toolpaths.push(profile);
+        let machine = MachineSettings::default();
+        let job = generate(&CamInput { doc: &doc, tools: &tools, machine: &machine });
+        assert!(!job.warnings.iter().any(|w| w.contains("also cuts around")), "{:?}", job.warnings);
+    }
 }
