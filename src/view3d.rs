@@ -202,7 +202,17 @@ impl App {
                     if depth >= -1e-6 {
                         return None;
                     }
-                    pockets.push((region, depth));
+                    // A round bit cannot reach a sharp inside corner. Opening the shape
+                    // by the tool radius gives the real floor and its corner radii.
+                    let r = tool.radius();
+                    if r <= 1e-6 {
+                        return None;
+                    }
+                    let floor = crate::geom::offset_region(&crate::geom::offset_region(&region, -r), r);
+                    if floor.0.is_empty() {
+                        return None;
+                    }
+                    pockets.push((floor, depth));
                 }
                 OpKind::ProfileOutside => {
                     if profile.is_some() || tp.tabs || tp.start_depth + tp.cut_depth < thickness - 1e-6 {
