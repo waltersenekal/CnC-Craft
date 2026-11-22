@@ -4,7 +4,7 @@
 use crate::app::App;
 use crate::model::{OpKind, ToolKind};
 use geo::{BooleanOps, MultiPolygon, Polygon, TriangulateEarcut};
-use egui::{Color32, Pos2, Stroke, Ui, Vec2};
+use egui::{Color32, Pos2, Rect, Stroke, Ui, Vec2};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PreviewView {
@@ -108,15 +108,66 @@ fn mp_rings(mp: &MultiPolygon<f64>) -> Vec<Vec<[f64; 2]>> {
     out
 }
 
-fn push_quad(verts: &mut Vec<egui::epaint::Vertex>, vdepth: &mut Vec<f32>, tris: &mut Vec<(f32, [u32; 3])>, p: [(Pos2, f32); 4], c: [Color32; 4]) {
-    let base = verts.len() as u32;
-    for k in 0..4 {
-        verts.push(egui::epaint::Vertex { pos: p[k].0, uv: egui::epaint::WHITE_UV, color: c[k] });
-        vdepth.push(p[k].1);
+struct RTri {
+    p: [Pos2; 3],
+    z: [f32; 3],
+    c: [Color32; 3],
+}
+
+/// Rasterise the vector part into a transparent image with a real depth buffer, so
+/// large top triangles, walls and pocket floors occlude each other correctly at any
+/// camera angle. Two samples per pixel give clean edges when drawn back at screen size.
+fn render_vec_image(tris: &[RTri], rect: Rect) -> egui::ColorImage {
+    let area = (rect.width().max(1.0) * rect.height().max(1.0)) as f32;
+    let ss = if area * 4.0 <= 2_000_000.0 { 2 } else { 1 };
+    let w = (rect.width().max(1.0) * ss as f32).round().max(1.0) as usize;
+    let h = (rect.height().max(1.0) * ss as f32).round().max(1.0) as usize;
+    let mut img = egui::ColorImage::new([w, h], Color32::TRANSPARENT);
+    let mut depth = vec![f32::MIN; w * h];
+    let edge = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    for t in tris {
+        let mut p = t.p.map(|q| [(q.x - rect.left()) * ss as f32, (q.y - rect.top()) * ss as f32]);
+        let mut z = t.z;
+        let mut c = t.c;
+        let mut area = edge(p[0], p[1], p[2]);
+        if area.abs() < 1e-9 {
+            continue;
+        }
+        if area < 0.0 {
+            p.swap(1, 2);
+            z.swap(1, 2);
+            c.swap(1, 2);
+            area = -area;
+        }
+        let minx = p.iter().map(|q| q[0]).fold(f32::MAX, f32::min).floor().max(0.0) as i32;
+        let maxx = (p.iter().map(|q| q[0]).fold(f32::MIN, f32::max).ceil() as i32).min(w as i32 - 1);
+        let miny = p.iter().map(|q| q[1]).fold(f32::MAX, f32::min).floor().max(0.0) as i32;
+        let maxy = (p.iter().map(|q| q[1]).fold(f32::MIN, f32::max).ceil() as i32).min(h as i32 - 1);
+        if minx > maxx || miny > maxy {
+            continue;
+        }
+        for y in miny..=maxy {
+            let py = y as f32 + 0.5;
+            for x in minx..=maxx {
+                let px = x as f32 + 0.5;
+                let w0 = edge(p[1], p[2], [px, py]) / area;
+                let w1 = edge(p[2], p[0], [px, py]) / area;
+                let w2 = edge(p[0], p[1], [px, py]) / area;
+                if w0 < -1e-5 || w1 < -1e-5 || w2 < -1e-5 {
+                    continue;
+                }
+                let d = w0 * z[0] + w1 * z[1] + w2 * z[2];
+                let idx = y as usize * w + x as usize;
+                if d <= depth[idx] {
+                    continue;
+                }
+                depth[idx] = d;
+                let mix = |a: u8, b: u8, d: u8| (a as f32 * w0 + b as f32 * w1 + d as f32 * w2).round().clamp(0.0, 255.0) as u8;
+                img.pixels[idx] = Color32::from_rgb(mix(c[0].r(), c[1].r(), c[2].r()), mix(c[0].g(), c[1].g(), c[2].g()), mix(c[0].b(), c[1].b(), c[2].b()));
+            }
+        }
     }
-    let d = (p[0].1 + p[1].1 + p[2].1 + p[3].1) / 4.0;
-    tris.push((d, [base, base + 1, base + 2]));
-    tris.push((d, [base, base + 2, base + 3]));
+    img
 }
 
 impl App {
@@ -125,7 +176,8 @@ impl App {
         let max_label = if self.design.preview_max { "Restore" } else { "Maximize" };
         let mut toggle_max = false;
         let cam = &mut self.design.cam;
-        ui.horizontal(|ui| {
+        // Wrap so the controls stay reachable in a narrow preview window.
+        ui.horizontal_wrapped(|ui| {
             ui.label("View");
             for (v, l, tip) in [
                 (PreviewView::Top, "Top", "Looking straight down. Drag to pan, scroll to zoom"),
@@ -140,6 +192,11 @@ impl App {
                 }
             }
             ui.separator();
+            if ui.add(egui::Button::new(max_label).small()).on_hover_text(if self.design.preview_max { "Return to a floating window (F11)" } else { "Fill the window with the preview (F11)" }).clicked() {
+                toggle_max = true;
+            }
+            if cam.view == PreviewView::Iso && ui.checkbox(&mut cam.show_compare, "Compare").on_hover_text("Show the drawing outline, the edge the bit actually leaves, and material left at the corners").changed() {}
+            ui.separator();
             if ui.add(egui::Button::new("−").small()).on_hover_text("Zoom out").clicked() {
                 cam.zoom = (cam.zoom / 1.25).clamp(0.2, 20.0);
             }
@@ -150,10 +207,6 @@ impl App {
                 cam.zoom = 1.0;
                 cam.pan = Vec2::ZERO;
             }
-            if ui.add(egui::Button::new(max_label).small()).on_hover_text(if self.design.preview_max { "Return to a floating window" } else { "Fill the window with the preview" }).clicked() {
-                toggle_max = true;
-            }
-            if cam.view == PreviewView::Iso && ui.checkbox(&mut cam.show_compare, "Compare").on_hover_text("Show the drawing outline, the edge the bit actually leaves, and material left at the corners").changed() {}
             ui.separator();
             ui.label("Depth ×");
             ui.add(egui::Slider::new(&mut cam.exag, 1.0..=6.0).max_decimals(1)).on_hover_text("Exaggerate depths so shallow cuts are easier to see");
@@ -169,12 +222,14 @@ impl App {
                 *cam = Cam { view: PreviewView::Iso, exag: cam.exag, img: cam.img.take(), ..Cam::default() };
             }
         });
+        if ui.input(|i| i.key_pressed(egui::Key::F11)) {
+            toggle_max = true;
+        }
         if toggle_max {
             self.design.preview_max = !self.design.preview_max;
         }
     }
 
-    /// Shared panning and zooming for the flat Top / Front / Side views.
     /// True when every enabled cut is a flat-ended 2.5D cut, so the preview should show
     /// true vertical walls and flat floors instead of an interpolated surface.
     fn flat_machining(&self) -> bool {
@@ -297,6 +352,7 @@ impl App {
         (ideal, actual, deviations)
     }
 
+    /// Shared panning and zooming for the flat Top / Front / Side views.
     pub(crate) fn preview_pan_zoom(&mut self, ui: &Ui, resp: &egui::Response) {
         let cam = &mut self.design.cam;
         if resp.dragged_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
@@ -459,9 +515,25 @@ impl App {
                 let grain = (((x * 0.33 + (y * 2.1).sin() * 1.2).sin()) * 0.5 + 0.5) * 8.0;
                 lit(n, [152.0 - depth * 26.0 - grain, 114.0 - depth * 22.0 - grain * 0.8, 72.0 - depth * 16.0 - grain * 0.5])
             };
-            // Painter order for a part seen from above: outside walls, pocket walls,
-            // pocket floors, then the top surface last. Sorting these large triangles
-            // by average depth makes the top disappear in patches.
+            let mut rtris: Vec<RTri> = vec![];
+            let regions = std::iter::once((&model.top, 0.0f32)).chain(model.floors.iter().map(|(m, z)| (m, *z)));
+            for (mp, z) in regions {
+                for poly in &mp.0 {
+                    for tri in poly.earcut_triangles() {
+                        let q = [tri.v1(), tri.v2(), tri.v3()];
+                        let mut p = [Pos2::ZERO; 3];
+                        let mut zs = [0.0f32; 3];
+                        let mut c = [Color32::BLACK; 3];
+                        for k in 0..3 {
+                            let (pos, d) = project(q[k].x as f32, q[k].y as f32, z);
+                            p[k] = pos;
+                            zs[k] = d;
+                            c[k] = top_col(q[k].x as f32, q[k].y as f32, z);
+                        }
+                        rtris.push(RTri { p, z: zs, c });
+                    }
+                }
+            }
             let wall_regions = std::iter::once((&model.outer, bottom)).chain(model.pocket_walls.iter().map(|(m, z)| (m, *z)));
             for (mp, z_bottom) in wall_regions {
                 if -z_bottom <= 0.005 {
@@ -470,8 +542,8 @@ impl App {
                 for poly in &mp.0 {
                     for ring in std::iter::once(poly.exterior()).chain(poly.interiors()) {
                         let pts: Vec<[f32; 2]> = ring.0.iter().map(|c| [c.x as f32, c.y as f32]).collect();
-                        for w in pts.windows(2) {
-                            let (a, b) = (w[0], w[1]);
+                        for i in 0..pts.len() {
+                            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
                             let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
                             let len = (dx * dx + dy * dy).sqrt();
                             if len < 1e-6 {
@@ -481,32 +553,41 @@ impl App {
                             if dot3(n, view) < 0.0 {
                                 n = [-n[0], -n[1], -n[2]];
                             }
-                            let p = [project(a[0], a[1], 0.0), project(b[0], b[1], 0.0), project(b[0], b[1], z_bottom), project(a[0], a[1], z_bottom)];
-                            let c = [wall_col(a[0], a[1], 0.0, n), wall_col(b[0], b[1], 0.0, n), wall_col(b[0], b[1], z_bottom, n), wall_col(a[0], a[1], z_bottom, n)];
-                            push_quad(&mut verts, &mut vdepth, &mut tris, p, c);
+                            let pa = project(a[0], a[1], 0.0);
+                            let pb = project(b[0], b[1], 0.0);
+                            let pb2 = project(b[0], b[1], z_bottom);
+                            let pa2 = project(a[0], a[1], z_bottom);
+                            let ca = wall_col(a[0], a[1], 0.0, n);
+                            let cb = wall_col(b[0], b[1], 0.0, n);
+                            let cb2 = wall_col(b[0], b[1], z_bottom, n);
+                            let ca2 = wall_col(a[0], a[1], z_bottom, n);
+                            rtris.push(RTri { p: [pa.0, pb.0, pb2.0], z: [pa.1, pb.1, pb2.1], c: [ca, cb, cb2] });
+                            rtris.push(RTri { p: [pa.0, pb2.0, pa2.0], z: [pa.1, pb2.1, pa2.1], c: [ca, cb2, ca2] });
                         }
                     }
                 }
             }
-            let regions = model.floors.iter().map(|(m, z)| (m, *z)).chain(std::iter::once((&model.top, 0.0f32)));
-            for (mp, z) in regions {
-                for poly in &mp.0 {
-                    for tri in poly.earcut_triangles() {
-                        let mut p = [(Pos2::ZERO, 0.0f32); 3];
-                        let mut c = [Color32::BLACK; 3];
-                        for (k, q) in [tri.v1(), tri.v2(), tri.v3()].into_iter().enumerate() {
-                            p[k] = project(q.x as f32, q.y as f32, z);
-                            c[k] = top_col(q.x as f32, q.y as f32, z);
-                        }
-                        let base = verts.len() as u32;
-                        for k in 0..3 {
-                            verts.push(egui::epaint::Vertex { pos: p[k].0, uv: egui::epaint::WHITE_UV, color: c[k] });
-                            vdepth.push(p[k].1);
-                        }
-                        let d = (p[0].1 + p[1].1 + p[2].1) / 3.0;
-                        tris.push((d, [base, base + 1, base + 2]));
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            for f in [cam.yaw, cam.pitch, cam.zoom, cam.pan.x, cam.pan.y, cam.exag] {
+                f.to_bits().hash(&mut hasher);
+            }
+            rect.width().to_bits().hash(&mut hasher);
+            rect.height().to_bits().hash(&mut hasher);
+            self.job_epoch.hash(&mut hasher);
+            let key = hasher.finish();
+            if self.flat_tex.as_ref().map_or(true, |(k, _)| *k != key) {
+                let image = render_vec_image(&rtris, rect);
+                match &mut self.flat_tex {
+                    Some((k, t)) => {
+                        *k = key;
+                        t.set(image, egui::TextureOptions::LINEAR);
                     }
+                    None => self.flat_tex = Some((key, ui.ctx().load_texture("cncflat3d", image, egui::TextureOptions::LINEAR))),
                 }
+            }
+            if let Some((_, tex)) = &self.flat_tex {
+                painter.image(tex.id(), rect, Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)), Color32::WHITE);
             }
         } else if flat {
             // Only mesh the part of the stock that can be on screen, and make the
@@ -756,13 +837,13 @@ impl App {
 
         if !has_vector {
             tris.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut mesh = egui::epaint::Mesh::default();
+            mesh.vertices = verts;
+            for (_, t) in tris {
+                mesh.add_triangle(t[0], t[1], t[2]);
+            }
+            painter.add(egui::Shape::mesh(mesh));
         }
-        let mut mesh = egui::epaint::Mesh::default();
-        mesh.vertices = verts;
-        for (_, t) in tris {
-            mesh.add_triangle(t[0], t[1], t[2]);
-        }
-        painter.add(egui::Shape::mesh(mesh));
 
         if let Some((ideal, actual, deviations)) = &compare {
             let mut fill = egui::epaint::Mesh::default();

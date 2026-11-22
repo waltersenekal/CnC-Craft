@@ -143,6 +143,10 @@ pub struct App {
     pub show_rapids: bool,
     pub job: Job,
     pub job_dirty: bool,
+    /// bumps whenever the job is regenerated, to invalidate cached preview textures
+    pub job_epoch: u64,
+    /// cached 3D texture for the exact-outline vector renderer
+    pub flat_tex: Option<(u64, egui::TextureHandle)>,
     pub preview_open: bool,
     pub sim: Option<Sim>,
     pub sim_tex: Option<egui::TextureHandle>,
@@ -277,6 +281,8 @@ impl App {
             show_rapids: true,
             job: Job::default(),
             job_dirty: true,
+            job_epoch: 0,
+            flat_tex: None,
             preview_open: false,
             sim: None,
             sim_tex: None,
@@ -531,6 +537,16 @@ impl App {
         if std::env::var("CNCCRAFT_COMPARE").is_ok() {
             app.preview_open = true;
             app.design.cam.show_compare = true;
+        }
+        if let Ok(v) = std::env::var("CNCCRAFT_CAM") {
+            let n: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            if n.len() >= 2 {
+                app.design.cam.yaw = n[0];
+                app.design.cam.pitch = n[1].clamp(0.05, std::f32::consts::FRAC_PI_2);
+            }
+            if n.len() >= 3 {
+                app.design.cam.zoom = n[2].clamp(0.2, 20.0);
+            }
         }
         if let Ok(z) = std::env::var("CNCCRAFT_PREVIEW_ZOOM") {
             if let Ok(z) = z.parse::<f32>() {

@@ -255,6 +255,7 @@ impl App {
     pub fn regenerate(&mut self) {
         let inp = cam::CamInput { doc: &self.doc, tools: &self.settings.tools, machine: &self.settings.machine };
         self.job = cam::generate(&inp);
+        self.job_epoch = self.job_epoch.wrapping_add(1);
         self.job_dirty = false;
         self.sim = None;
         self.sim_travel = sim::travel(&self.job);
