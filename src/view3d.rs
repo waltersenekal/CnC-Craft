@@ -3,6 +3,7 @@
 
 use crate::app::App;
 use crate::model::{OpKind, ToolKind};
+use geo::{BooleanOps, MultiPolygon, Polygon, TriangulateEarcut};
 use egui::{Color32, Pos2, Stroke, Ui, Vec2};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -64,6 +65,42 @@ fn wood_rgb(x: f32, y: f32, h: f32, thick: f32) -> [f32; 3] {
     } else {
         [200.0 - depth * 62.0 - grain * 0.7, 152.0 - depth * 54.0 - grain * 0.55, 98.0 - depth * 38.0 - grain * 0.4]
     }
+}
+
+/// A clean 2.5D model built from the shape outlines rather than the height map.
+/// Used when the job is only flat-ended pockets and a through outside profile, where
+/// the exact shape contour gives clean walls instead of a stair-stepped raster edge.
+struct VectorModel {
+    top: MultiPolygon<f64>,
+    floors: Vec<(MultiPolygon<f64>, f32)>,
+    pocket_walls: Vec<(MultiPolygon<f64>, f32)>,
+    outer: MultiPolygon<f64>,
+}
+
+fn mp_bbox(mp: &MultiPolygon<f64>) -> Option<([f32; 2], [f32; 2])> {
+    let (mut mn, mut mx) = ([f32::MAX; 2], [f32::MIN; 2]);
+    let mut any = false;
+    for poly in &mp.0 {
+        for ring in std::iter::once(poly.exterior()).chain(poly.interiors()) {
+            for c in &ring.0 {
+                any = true;
+                mn = [mn[0].min(c.x as f32), mn[1].min(c.y as f32)];
+                mx = [mx[0].max(c.x as f32), mx[1].max(c.y as f32)];
+            }
+        }
+    }
+    any.then_some((mn, mx))
+}
+
+fn push_quad(verts: &mut Vec<egui::epaint::Vertex>, vdepth: &mut Vec<f32>, tris: &mut Vec<(f32, [u32; 3])>, p: [(Pos2, f32); 4], c: [Color32; 4]) {
+    let base = verts.len() as u32;
+    for k in 0..4 {
+        verts.push(egui::epaint::Vertex { pos: p[k].0, uv: egui::epaint::WHITE_UV, color: c[k] });
+        vdepth.push(p[k].1);
+    }
+    let d = (p[0].1 + p[1].1 + p[2].1 + p[3].1) / 4.0;
+    tris.push((d, [base, base + 1, base + 2]));
+    tris.push((d, [base, base + 2, base + 3]));
 }
 
 impl App {
@@ -137,6 +174,63 @@ impl App {
             }
         }
         any
+    }
+
+    fn flat_vector_model(&self) -> Option<VectorModel> {
+        let thickness = self.doc.stock.thickness;
+        let stock = MultiPolygon::new(vec![Polygon::new(
+            geo::LineString::from(vec![(0.0, 0.0), (self.doc.stock.width, 0.0), (self.doc.stock.width, self.doc.stock.height), (0.0, self.doc.stock.height), (0.0, 0.0)]),
+            vec![],
+        )]);
+        let mut pockets: Vec<(MultiPolygon<f64>, f32)> = vec![];
+        let mut profile: Option<MultiPolygon<f64>> = None;
+        let mut any = false;
+        for (i, tp) in self.doc.toolpaths.iter().enumerate().filter(|(_, t)| t.enabled) {
+            any = true;
+            let Some(tool) = self.job.tools.get(i).and_then(|t| t.as_ref()) else { return None };
+            if !matches!(tool.kind, ToolKind::FlatEnd | ToolKind::Drill) || tp.ramp || tp.allowance.abs() > 1e-6 || tp.start_depth.abs() > 1e-6 {
+                return None;
+            }
+            let shapes: Vec<&crate::model::Shape> = tp.shape_ids.iter().filter(|id| !self.doc.keepout.contains(id)).filter_map(|id| self.doc.shape(*id)).collect();
+            let region = crate::geom::region_of(shapes.into_iter());
+            if region.0.is_empty() {
+                return None;
+            }
+            match tp.op {
+                OpKind::Pocket => {
+                    let depth = -(tp.start_depth + tp.cut_depth) as f32;
+                    if depth >= -1e-6 {
+                        return None;
+                    }
+                    pockets.push((region, depth));
+                }
+                OpKind::ProfileOutside => {
+                    if profile.is_some() || tp.tabs || tp.start_depth + tp.cut_depth < thickness - 1e-6 {
+                        return None;
+                    }
+                    profile = Some(region);
+                }
+                _ => return None,
+            }
+        }
+        if !any {
+            return None;
+        }
+        let has_profile = profile.is_some();
+        let part = profile.unwrap_or_else(|| stock.clone());
+        let mut top = part.clone();
+        let mut floors = vec![];
+        let mut pocket_walls = vec![];
+        for (region, depth) in pockets {
+            let floor = region.intersection(&part);
+            if floor.0.is_empty() {
+                continue;
+            }
+            top = top.difference(&floor);
+            floors.push((floor.clone(), depth));
+            pocket_walls.push((floor, depth));
+        }
+        Some(VectorModel { top, floors, pocket_walls, outer: if has_profile { part } else { stock } })
     }
 
     pub(crate) fn preview_pan_zoom(&mut self, ui: &Ui, resp: &egui::Response) {
@@ -221,10 +315,15 @@ impl App {
             (Pos2::new(center.x + xr * scale, center.y - up * scale), depth)
         };
 
+        let flat = self.flat_machining();
+        let vector = self.flat_vector_model();
+        let has_vector = vector.is_some();
+        let (smn, smx) = vector.as_ref().and_then(|m| mp_bbox(&m.outer)).unwrap_or(([0.0, 0.0], [sw, sh]));
+
         // A soft contact shadow makes the block sit on a surface rather than float.
         let bottom = -thick;
         let shadow = |grow: f32, drop: f32| -> Vec<Pos2> {
-            [[-grow, -grow], [sw + grow, -grow], [sw + grow, sh + grow], [-grow, sh + grow]]
+            [[smn[0] - grow, smn[1] - grow], [smx[0] + grow, smn[1] - grow], [smx[0] + grow, smx[1] + grow], [smn[0] - grow, smx[1] + grow]]
                 .iter()
                 .map(|p| project(p[0], p[1], bottom - 0.8).0 + egui::vec2(5.0, 8.0 + drop))
                 .collect()
@@ -276,7 +375,6 @@ impl App {
 
         // Flat-ended 2.5D cuts get a block surface with true vertical walls. Curved,
         // V-shaped and ball-nose cuts keep the smooth shared-vertex surface.
-        let flat = self.flat_machining();
         let target_quads = if flat { 300_000.0 } else { 160_000.0 };
         let step = (((w * h) as f32 / target_quads).sqrt().ceil() as usize).max(1);
         let gw = w.div_ceil(step);
@@ -285,7 +383,64 @@ impl App {
         let mut vdepth: Vec<f32> = Vec::with_capacity(verts.capacity());
         let mut tris: Vec<(f32, [u32; 3])> = Vec::with_capacity(gw * gh * 2 + 8 * (gw + gh) * 2);
 
-        if flat {
+        if let Some(model) = vector {
+            let top_col = |x: f32, y: f32, z: f32| lit([0.0, 0.0, 1.0], wood_rgb(x, y, z, thick));
+            let wall_col = |x: f32, y: f32, z: f32, n: [f32; 3]| -> Color32 {
+                if z <= bottom + 0.05 {
+                    return Color32::from_rgb(34, 37, 43);
+                }
+                let n = if dot3(n, view) < 0.0 { [-n[0], -n[1], -n[2]] } else { n };
+                let depth = ((-z) / thick.max(0.1)).clamp(0.0, 1.0);
+                let grain = (((x * 0.33 + (y * 2.1).sin() * 1.2).sin()) * 0.5 + 0.5) * 8.0;
+                lit(n, [152.0 - depth * 26.0 - grain, 114.0 - depth * 22.0 - grain * 0.8, 72.0 - depth * 16.0 - grain * 0.5])
+            };
+            let regions = std::iter::once((&model.top, 0.0f32)).chain(model.floors.iter().map(|(m, z)| (m, *z)));
+            for (mp, z) in regions {
+                for poly in &mp.0 {
+                    for tri in poly.earcut_triangles() {
+                        let mut p = [(Pos2::ZERO, 0.0f32); 3];
+                        let mut c = [Color32::BLACK; 3];
+                        for (k, q) in [tri.v1(), tri.v2(), tri.v3()].into_iter().enumerate() {
+                            p[k] = project(q.x as f32, q.y as f32, z);
+                            c[k] = top_col(q.x as f32, q.y as f32, z);
+                        }
+                        let base = verts.len() as u32;
+                        for k in 0..3 {
+                            verts.push(egui::epaint::Vertex { pos: p[k].0, uv: egui::epaint::WHITE_UV, color: c[k] });
+                            vdepth.push(p[k].1);
+                        }
+                        let d = (p[0].1 + p[1].1 + p[2].1) / 3.0;
+                        tris.push((d, [base, base + 1, base + 2]));
+                    }
+                }
+            }
+            let wall_regions = model.pocket_walls.iter().map(|(m, z)| (m, *z)).chain(std::iter::once((&model.outer, bottom)));
+            for (mp, z_bottom) in wall_regions {
+                if -z_bottom <= 0.005 {
+                    continue;
+                }
+                for poly in &mp.0 {
+                    for ring in std::iter::once(poly.exterior()).chain(poly.interiors()) {
+                        let pts: Vec<[f32; 2]> = ring.0.iter().map(|c| [c.x as f32, c.y as f32]).collect();
+                        for w in pts.windows(2) {
+                            let (a, b) = (w[0], w[1]);
+                            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                            let len = (dx * dx + dy * dy).sqrt();
+                            if len < 1e-6 {
+                                continue;
+                            }
+                            let mut n = [dy / len, -dx / len, 0.0];
+                            if dot3(n, view) < 0.0 {
+                                n = [-n[0], -n[1], -n[2]];
+                            }
+                            let p = [project(a[0], a[1], 0.0), project(b[0], b[1], 0.0), project(b[0], b[1], z_bottom), project(a[0], a[1], z_bottom)];
+                            let c = [wall_col(a[0], a[1], 0.0, n), wall_col(b[0], b[1], 0.0, n), wall_col(b[0], b[1], z_bottom, n), wall_col(a[0], a[1], z_bottom, n)];
+                            push_quad(&mut verts, &mut vdepth, &mut tris, p, c);
+                        }
+                    }
+                }
+            }
+        } else if flat {
             // Only mesh the part of the stock that can be on screen, and make the
             // cells finer as the view zooms in. This keeps radii smooth without
             // turning the whole stock into millions of triangles.
@@ -540,6 +695,7 @@ impl App {
         painter.add(egui::Shape::mesh(mesh));
 
         // A light rim along the stock's top edge catches the studio light.
+        if !has_vector {
         let mut rim: Vec<Pos2> = vec![];
         for gi in 0..=gw {
             let x = (gi * step).min(w) as f32 * cell;
@@ -560,6 +716,7 @@ impl App {
         if rim.len() > 1 {
             rim.push(rim[0]);
             painter.add(egui::Shape::line(rim, Stroke::new(1.0f32, Color32::from_rgba_unmultiplied(248, 218, 166, 105))));
+        }
         }
 
         // toolpaths at their real depths
