@@ -73,6 +73,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     let options = eframe::NativeOptions {
+        multisampling: 4,
         viewport: egui::ViewportBuilder::default()
             .with_app_id("cnccraft")
             .with_title("CncCraft")

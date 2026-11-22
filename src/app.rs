@@ -523,6 +523,15 @@ impl App {
         if std::env::var("CNCCRAFT_PREVIEW").is_ok() {
             app.preview_open = true;
         }
+        if std::env::var("CNCCRAFT_PREVIEW_MAX").is_ok() {
+            app.preview_open = true;
+            app.design.preview_max = true;
+        }
+        if let Ok(z) = std::env::var("CNCCRAFT_PREVIEW_ZOOM") {
+            if let Ok(z) = z.parse::<f32>() {
+                app.design.cam.zoom = z.clamp(0.2, 20.0);
+            }
+        }
         if let Ok(v) = std::env::var("CNCCRAFT_TP") {
             // test hook: show the settings of the n-th toolpath (1 = first)
             let n = v.parse::<usize>().unwrap_or(1).max(1) - 1;

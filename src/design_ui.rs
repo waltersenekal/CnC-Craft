@@ -71,6 +71,8 @@ pub struct DesignState {
     pub canvas_rect: Option<egui::Rect>,
     pub sim_speed: f64,
     pub cam: crate::view3d::Cam,
+    /// Fill the whole window with the cut preview.
+    pub preview_max: bool,
     pub checks_open: bool,
     pub checks: Vec<(bool, String)>,
     pub checks_pending: Option<crate::checks::Pending>,
@@ -198,6 +200,7 @@ impl Default for DesignState {
             canvas_rect: None,
             sim_speed: 5.0,
             cam: Default::default(),
+            preview_max: false,
             checks_open: false,
             checks: vec![],
             checks_pending: None,
